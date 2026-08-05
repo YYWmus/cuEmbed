@@ -80,6 +80,11 @@ ABSL_FLAG(bool, enable_stderr, true,
 ABSL_FLAG(bool, clear_caches, true,
           "If true, will clear caches between invocations by summing the "
           "full embedding table.");
+ABSL_FLAG(bool, permute_indices, true,
+          "If true, randomly permute generated category ids before lookup. "
+          "This scatters power-law-hot logical ids across physical rows.");
+ABSL_FLAG(bool, shuffle_indices, true,
+          "If true, shuffle the order of generated ids within each sample.");
 // clang-format on
 
 template <typename T>
@@ -103,8 +108,9 @@ std::string combine_mode_str(cuembed::CombineMode mode) {
 
 void dump_csv_header(std::ofstream& outfile) {
   outfile << "num_categories,batch_size,hotness,alpha,embed_width,combine_mode,"
-             "is_csr,is_weighted,compressed_grad,skip_grad_init,name,"
-             "iterations,elapsed_time_ms,avg_time_ms,algo_bw_l2,algo_bw_dram"
+             "permute_indices,shuffle_indices,is_csr,is_weighted,"
+             "compressed_grad,skip_grad_init,name,iterations,elapsed_time_ms,"
+             "avg_time_ms,algo_bw_l2,algo_bw_dram"
           << std::endl;
 }
 
@@ -118,10 +124,11 @@ void dump_csv_line(std::ofstream& outfile,
   outfile << options.num_categories() << "," << options.batch_size() << ","
           << options.hotness() << "," << options.alpha() << ","
           << options.embed_width() << ","
-          << combine_mode_str(options.combine_mode()) << "," << options.is_csr()
-          << "," << options.is_weighted() << "," << options.compressed_grad()
-          << "," << options.skip_grad_init() << "," << name << ","
-          << absl::StrFormat("%d ", iterations) << ","
+          << combine_mode_str(options.combine_mode()) << ","
+          << options.permute_indices() << "," << options.shuffle_indices() << ","
+          << options.is_csr() << "," << options.is_weighted() << ","
+          << options.compressed_grad() << "," << options.skip_grad_init() << ","
+          << name << "," << absl::StrFormat("%d ", iterations) << ","
           << absl::StrFormat("%.2f ", elapsed_time_ms) << ","
           << absl::StrFormat("%.2f ", elapsed_time_ms / iterations) << ","
           << absl::StrFormat("%.2f", algo_bw_l2) << ","
@@ -158,7 +165,9 @@ void EmbeddingLookupBenchmark(const int num_categories,
                               const bool check_result,
                               const int iterations,
                               const bool enable_csv,
-                              const bool clear_caches) {
+                              const bool clear_caches,
+                              const bool permute_indices,
+                              const bool shuffle_indices) {
   utils::AllocationOptions options;
   options.num_categories(num_categories)
       .batch_size(batch_size)
@@ -169,7 +178,9 @@ void EmbeddingLookupBenchmark(const int num_categories,
       .is_csr(is_csr)
       .is_weighted(is_weighted)
       .compressed_grad(compressed_grad)
-      .skip_grad_init(skip_grad_init);
+      .skip_grad_init(skip_grad_init)
+      .permute_indices(permute_indices)
+      .shuffle_indices(shuffle_indices);
 
   std::ofstream outfile;
   if (enable_csv) {
@@ -539,6 +550,8 @@ int main(int argc, char** argv) {
   bool enable_csv = absl::GetFlag(FLAGS_enable_csv);
   bool enable_stderr = absl::GetFlag(FLAGS_enable_stderr);
   bool clear_caches = absl::GetFlag(FLAGS_clear_caches);
+  bool permute_indices = absl::GetFlag(FLAGS_permute_indices);
+  bool shuffle_indices = absl::GetFlag(FLAGS_shuffle_indices);
   LOG(INFO) << "parsed flag num_categories: " << num_categories
             << ", embed_width: " << embed_width
             << ", batch_size: " << batch_size << ", hotness: " << hotness
@@ -552,7 +565,9 @@ int main(int argc, char** argv) {
             << ", forward_only: " << forward_only
             << ", enable_csv: " << enable_csv
             << ", enable_stderr: " << enable_stderr
-            << ", clear_caches: " << clear_caches;
+            << ", clear_caches: " << clear_caches
+            << ", permute_indices: " << permute_indices
+            << ", shuffle_indices: " << shuffle_indices;
 
   if (enable_stderr) {
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
@@ -575,7 +590,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   } else if (half_embedding_type && !use_int64_indices && fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int32_t, int, true>(
         num_categories,
@@ -591,7 +608,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   } else if (half_embedding_type && use_int64_indices && !fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int64_t, int, false>(
         num_categories,
@@ -607,7 +626,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   } else if (half_embedding_type && !use_int64_indices && !fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int32_t, int, false>(
         num_categories,
@@ -623,7 +644,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   } else if (!half_embedding_type && use_int64_indices) {
     cuembed::EmbeddingLookupBenchmark<float, int64_t, int, true>(
         num_categories,
@@ -639,7 +662,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   } else if (!half_embedding_type && !use_int64_indices) {
     cuembed::EmbeddingLookupBenchmark<float, int32_t, int, true>(
         num_categories,
@@ -655,7 +680,9 @@ int main(int argc, char** argv) {
         check_result,
         iterations,
         enable_csv,
-        clear_caches);
+        clear_caches,
+        permute_indices,
+        shuffle_indices);
   }
 
   return 0;
