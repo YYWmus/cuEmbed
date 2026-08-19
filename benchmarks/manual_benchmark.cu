@@ -26,6 +26,8 @@
 #include <thrust/universal_vector.h>
 
 #include <fstream>
+#include <algorithm>
+#include <cstdint>
 #include <type_traits>
 
 #include "absl/flags/flag.h"
@@ -85,7 +87,162 @@ ABSL_FLAG(bool, permute_indices, true,
           "This scatters power-law-hot logical ids across physical rows.");
 ABSL_FLAG(bool, shuffle_indices, true,
           "If true, shuffle the order of generated ids within each sample.");
+ABSL_FLAG(int64_t, l2_persist_start_row, 0,
+          "Physical embedding row at which the optional L2 persistence "
+          "region starts.");
+ABSL_FLAG(int64_t, l2_persist_rows, 0,
+          "Number of whole embedding rows in the optional L2 persistence "
+          "region. Zero disables row-count configuration.");
+ABSL_FLAG(int64_t, l2_persist_region_bytes, 0,
+          "Size in bytes of the optional L2 persistence region. Must be a "
+          "whole number of embedding rows. Zero disables byte-size "
+          "configuration.");
 // clang-format on
+
+struct L2PersistenceConfig {
+  bool enabled{false};
+  int64_t requested_start_row{0};
+  int64_t requested_rows{0};
+  int64_t requested_bytes{0};
+  int64_t effective_start_row{0};
+  int64_t effective_rows{0};
+  int64_t effective_bytes{0};
+  int64_t reserved_bytes{0};
+  float hit_ratio{0.0F};
+  size_t previous_set_aside_bytes{0};
+};
+
+template <typename ElemT>
+L2PersistenceConfig ConfigureL2Persistence(
+    ElemT* embedding,
+    const int num_categories,
+    const int embed_width,
+    const int64_t start_row,
+    const int64_t persist_rows,
+    const int64_t persist_region_bytes) {
+  L2PersistenceConfig config;
+  if (persist_rows == 0 && persist_region_bytes == 0) {
+    return config;
+  }
+
+  if (start_row < 0 || persist_rows < 0 || persist_region_bytes < 0) {
+    LOG(FATAL) << "L2 persistence start row, row count, and byte size must "
+               << "be non-negative.";
+  }
+  if (persist_rows > 0 && persist_region_bytes > 0) {
+    LOG(FATAL) << "Specify exactly one of --l2_persist_rows or "
+               << "--l2_persist_region_bytes.";
+  }
+  if (start_row >= num_categories) {
+    LOG(FATAL) << "--l2_persist_start_row=" << start_row
+               << " is outside the embedding table with " << num_categories
+               << " rows.";
+  }
+
+  const int64_t row_bytes =
+      static_cast<int64_t>(embed_width) * static_cast<int64_t>(sizeof(ElemT));
+  CHECK_GT(row_bytes, 0);
+  int64_t requested_rows = persist_rows;
+  if (persist_region_bytes > 0) {
+    if (persist_region_bytes % row_bytes != 0) {
+      LOG(FATAL) << "--l2_persist_region_bytes=" << persist_region_bytes
+                 << " must be a multiple of the embedding row size "
+                 << row_bytes << " bytes.";
+    }
+    requested_rows = persist_region_bytes / row_bytes;
+  }
+  CHECK_GT(requested_rows, 0);
+  if (requested_rows > num_categories - start_row) {
+    LOG(FATAL) << "Requested L2 persistence rows [" << start_row << ", "
+               << (start_row + requested_rows)
+               << ") exceed the embedding table with " << num_categories
+               << " rows.";
+  }
+
+  int device = 0;
+  CHECK_CUDA(cudaGetDevice(&device));
+  cudaDeviceProp device_properties{};
+  CHECK_CUDA(cudaGetDeviceProperties(&device_properties, device));
+  if (device_properties.major < 8 ||
+      device_properties.accessPolicyMaxWindowSize == 0 ||
+      device_properties.persistingL2CacheMaxSize == 0) {
+    LOG(FATAL) << "L2 persistence is unavailable on device " << device
+               << " (compute capability " << device_properties.major << "."
+               << device_properties.minor
+               << ", access-policy window max "
+               << device_properties.accessPolicyMaxWindowSize
+               << ", persisting L2 max "
+               << device_properties.persistingL2CacheMaxSize
+               << "). This can occur on unsupported devices or with MIG.";
+  }
+
+  const int64_t max_window_rows =
+      static_cast<int64_t>(device_properties.accessPolicyMaxWindowSize) /
+      row_bytes;
+  if (max_window_rows == 0) {
+    LOG(FATAL) << "Embedding row size " << row_bytes
+               << " exceeds CUDA's access-policy window maximum "
+               << device_properties.accessPolicyMaxWindowSize << " bytes.";
+  }
+  const int64_t effective_rows = std::min(requested_rows, max_window_rows);
+  const int64_t effective_bytes = effective_rows * row_bytes;
+  const size_t requested_set_aside = std::min(
+      static_cast<size_t>(effective_bytes),
+      static_cast<size_t>(device_properties.persistingL2CacheMaxSize));
+
+  CHECK_CUDA(cudaDeviceGetLimit(&config.previous_set_aside_bytes,
+                                cudaLimitPersistingL2CacheSize));
+  CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                requested_set_aside));
+  size_t actual_set_aside = 0;
+  CHECK_CUDA(cudaDeviceGetLimit(&actual_set_aside,
+                                cudaLimitPersistingL2CacheSize));
+  if (actual_set_aside != requested_set_aside) {
+    LOG(FATAL) << "CUDA did not apply the requested persisting-L2 set-aside "
+               << requested_set_aside << " bytes (actual " << actual_set_aside
+               << ").";
+  }
+
+  cudaStreamAttrValue stream_attribute{};
+  stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(
+      embedding + static_cast<size_t>(start_row) * embed_width);
+  stream_attribute.accessPolicyWindow.num_bytes =
+      static_cast<size_t>(effective_bytes);
+  stream_attribute.accessPolicyWindow.hitRatio =
+      static_cast<float>(actual_set_aside) / static_cast<float>(effective_bytes);
+  stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+  CHECK_CUDA(cudaStreamSetAttribute(
+      0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
+
+  config.enabled = true;
+  config.requested_start_row = start_row;
+  config.requested_rows = requested_rows;
+  config.requested_bytes = requested_rows * row_bytes;
+  config.effective_start_row = start_row;
+  config.effective_rows = effective_rows;
+  config.effective_bytes = effective_bytes;
+  config.reserved_bytes = static_cast<int64_t>(actual_set_aside);
+  config.hit_ratio = stream_attribute.accessPolicyWindow.hitRatio;
+  return config;
+}
+
+void ResetL2Persistence(const L2PersistenceConfig& config) {
+  if (!config.enabled) {
+    return;
+  }
+  cudaStreamAttrValue stream_attribute{};
+  stream_attribute.accessPolicyWindow.base_ptr = nullptr;
+  stream_attribute.accessPolicyWindow.num_bytes = 0;
+  stream_attribute.accessPolicyWindow.hitRatio = 1.0F;
+  stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  CHECK_CUDA(cudaStreamSetAttribute(
+      0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
+  CHECK_CUDA(cudaCtxResetPersistingL2Cache());
+  CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                config.previous_set_aside_bytes));
+}
 
 template <typename T>
 void ValidateResult(const thrust::universal_vector<T>& result,
@@ -110,7 +267,11 @@ void dump_csv_header(std::ofstream& outfile) {
   outfile << "num_categories,batch_size,hotness,alpha,embed_width,combine_mode,"
              "permute_indices,shuffle_indices,is_csr,is_weighted,"
              "compressed_grad,skip_grad_init,name,iterations,elapsed_time_ms,"
-             "avg_time_ms,algo_bw_l2,algo_bw_dram"
+             "avg_time_ms,algo_bw_l2,algo_bw_dram,l2_persist_enabled,"
+             "l2_persist_requested_start_row,l2_persist_requested_rows,"
+             "l2_persist_requested_bytes,l2_persist_effective_start_row,"
+             "l2_persist_effective_rows,l2_persist_effective_bytes,"
+             "l2_persist_reserved_bytes,l2_persist_hit_ratio"
           << std::endl;
 }
 
@@ -120,7 +281,8 @@ void dump_csv_line(std::ofstream& outfile,
                    int iterations,
                    double elapsed_time_ms,
                    double algo_bw_l2,
-                   double algo_bw_dram) {
+                   double algo_bw_dram,
+                   const L2PersistenceConfig& l2_persistence) {
   outfile << options.num_categories() << "," << options.batch_size() << ","
           << options.hotness() << "," << options.alpha() << ","
           << options.embed_width() << ","
@@ -130,9 +292,18 @@ void dump_csv_line(std::ofstream& outfile,
           << options.compressed_grad() << "," << options.skip_grad_init() << ","
           << name << "," << absl::StrFormat("%d ", iterations) << ","
           << absl::StrFormat("%.2f ", elapsed_time_ms) << ","
-          << absl::StrFormat("%.2f ", elapsed_time_ms / iterations) << ","
+          << absl::StrFormat("%.6f ", elapsed_time_ms / iterations) << ","
           << absl::StrFormat("%.2f", algo_bw_l2) << ","
-          << absl::StrFormat("%.2f", algo_bw_dram) << std::endl;
+          << absl::StrFormat("%.2f", algo_bw_dram) << ","
+          << l2_persistence.enabled << ","
+          << l2_persistence.requested_start_row << ","
+          << l2_persistence.requested_rows << ","
+          << l2_persistence.requested_bytes << ","
+          << l2_persistence.effective_start_row << ","
+          << l2_persistence.effective_rows << ","
+          << l2_persistence.effective_bytes << ","
+          << l2_persistence.reserved_bytes << ","
+          << l2_persistence.hit_ratio << std::endl;
 }
 
 bool file_exists(const std::string& fname) {
@@ -167,7 +338,10 @@ void EmbeddingLookupBenchmark(const int num_categories,
                               const bool enable_csv,
                               const bool clear_caches,
                               const bool permute_indices,
-                              const bool shuffle_indices) {
+                              const bool shuffle_indices,
+                              const int64_t l2_persist_start_row,
+                              const int64_t l2_persist_rows,
+                              const int64_t l2_persist_region_bytes) {
   utils::AllocationOptions options;
   options.num_categories(num_categories)
       .batch_size(batch_size)
@@ -206,6 +380,13 @@ void EmbeddingLookupBenchmark(const int num_categories,
       d_a;
   utils::AllocateHost(options, &u_a, forward_only);
   utils::AllocateDevice(options, u_a, &d_a, forward_only);
+  const L2PersistenceConfig l2_persistence = ConfigureL2Persistence(
+      d_a.embedding.data().get(),
+      num_categories,
+      embed_width,
+      l2_persist_start_row,
+      l2_persist_rows,
+      l2_persist_region_bytes);
 
   // Used for clearing caches
   thrust::device_vector<int> clear_cache_buffer;
@@ -278,7 +459,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   iterations,
                   elapsed_time_ms,
                   algo_bw,
-                  0.0 /*algo_bw_dram*/);
+                  0.0 /*algo_bw_dram*/,
+                  l2_persistence);
   }
   LOG(INFO) << "Embedding forward. Iterations: "
             << absl::StrFormat("%d ", iterations) << ", Total time [ms]: "
@@ -298,6 +480,7 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
 
   if (forward_only) {
+    ResetL2Persistence(l2_persistence);
     return;
   }
 
@@ -370,7 +553,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   iterations,
                   elapsed_time_ms_transpose,
                   0.0,
-                  algo_bw_transpose);
+                  algo_bw_transpose,
+                  l2_persistence);
   }
 
   LOG(INFO) << "Transpose. Iterations: " << absl::StrFormat("%d ", iterations)
@@ -490,7 +674,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   iterations,
                   elapsed_time_ms_backward,
                   algo_bw_backward_l2,
-                  algo_bw_backward_dram);
+                  algo_bw_backward_dram,
+                  l2_persistence);
   }
 
   LOG(INFO) << "Backward. Iterations: " << absl::StrFormat("%d ", iterations)
@@ -524,6 +709,7 @@ void EmbeddingLookupBenchmark(const int num_categories,
   if (enable_csv) {
     outfile.close();
   }
+  ResetL2Persistence(l2_persistence);
 }
 
 }  // namespace cuembed
@@ -552,6 +738,10 @@ int main(int argc, char** argv) {
   bool clear_caches = absl::GetFlag(FLAGS_clear_caches);
   bool permute_indices = absl::GetFlag(FLAGS_permute_indices);
   bool shuffle_indices = absl::GetFlag(FLAGS_shuffle_indices);
+  int64_t l2_persist_start_row = absl::GetFlag(FLAGS_l2_persist_start_row);
+  int64_t l2_persist_rows = absl::GetFlag(FLAGS_l2_persist_rows);
+  int64_t l2_persist_region_bytes =
+      absl::GetFlag(FLAGS_l2_persist_region_bytes);
   LOG(INFO) << "parsed flag num_categories: " << num_categories
             << ", embed_width: " << embed_width
             << ", batch_size: " << batch_size << ", hotness: " << hotness
@@ -567,7 +757,10 @@ int main(int argc, char** argv) {
             << ", enable_stderr: " << enable_stderr
             << ", clear_caches: " << clear_caches
             << ", permute_indices: " << permute_indices
-            << ", shuffle_indices: " << shuffle_indices;
+            << ", shuffle_indices: " << shuffle_indices
+            << ", l2_persist_start_row: " << l2_persist_start_row
+            << ", l2_persist_rows: " << l2_persist_rows
+            << ", l2_persist_region_bytes: " << l2_persist_region_bytes;
 
   if (enable_stderr) {
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
@@ -592,7 +785,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   } else if (half_embedding_type && !use_int64_indices && fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int32_t, int, true>(
         num_categories,
@@ -610,7 +806,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   } else if (half_embedding_type && use_int64_indices && !fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int64_t, int, false>(
         num_categories,
@@ -628,7 +827,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   } else if (half_embedding_type && !use_int64_indices && !fp16_math) {
     cuembed::EmbeddingLookupBenchmark<__half, int32_t, int, false>(
         num_categories,
@@ -646,7 +848,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   } else if (!half_embedding_type && use_int64_indices) {
     cuembed::EmbeddingLookupBenchmark<float, int64_t, int, true>(
         num_categories,
@@ -664,7 +869,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   } else if (!half_embedding_type && !use_int64_indices) {
     cuembed::EmbeddingLookupBenchmark<float, int32_t, int, true>(
         num_categories,
@@ -682,7 +890,10 @@ int main(int argc, char** argv) {
         enable_csv,
         clear_caches,
         permute_indices,
-        shuffle_indices);
+        shuffle_indices,
+        l2_persist_start_row,
+        l2_persist_rows,
+        l2_persist_region_bytes);
   }
 
   return 0;
