@@ -198,9 +198,14 @@ L2PersistenceConfig ConfigureL2Persistence(
   CHECK_CUDA(cudaDeviceGetLimit(&actual_set_aside,
                                 cudaLimitPersistingL2CacheSize));
   if (actual_set_aside != requested_set_aside) {
-    LOG(FATAL) << "CUDA did not apply the requested persisting-L2 set-aside "
-               << requested_set_aside << " bytes (actual " << actual_set_aside
-               << ").";
+    // CUDA may round or retain a larger device-level set-aside (for example,
+    // when another runtime component has already configured it). The stream
+    // policy remains valid as long as its hit ratio is in [0, 1], so record
+    // the effective value and continue rather than rejecting the benchmark.
+    LOG(WARNING) << "CUDA did not apply the requested persisting-L2 set-aside "
+                 << requested_set_aside << " bytes exactly (actual "
+                 << actual_set_aside << "); continuing with the effective "
+                 << "set-aside.";
   }
 
   cudaStreamAttrValue stream_attribute{};
@@ -208,8 +213,9 @@ L2PersistenceConfig ConfigureL2Persistence(
       embedding + static_cast<size_t>(start_row) * embed_width);
   stream_attribute.accessPolicyWindow.num_bytes =
       static_cast<size_t>(effective_bytes);
-  stream_attribute.accessPolicyWindow.hitRatio =
-      static_cast<float>(actual_set_aside) / static_cast<float>(effective_bytes);
+  stream_attribute.accessPolicyWindow.hitRatio = std::min(
+      1.0F, static_cast<float>(actual_set_aside) /
+                 static_cast<float>(effective_bytes));
   stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
   stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
   CHECK_CUDA(cudaStreamSetAttribute(
