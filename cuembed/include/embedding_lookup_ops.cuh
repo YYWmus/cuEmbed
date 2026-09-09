@@ -30,6 +30,12 @@
 
 #include "cuembed/include/embedding_lookup_types.cuh"
 
+// The direct row-cutoff load path remains under development.  Keep it out of
+// normal builds while validating the range-policy implementation in isolation.
+#ifndef CUEMBED_ENABLE_EXPERIMENTAL_DIRECT_HINTS
+#define CUEMBED_ENABLE_EXPERIMENTAL_DIRECT_HINTS 0
+#endif
+
 #ifndef __CUDA_ARCH__
 #define FOR_HOST_TEST
 #endif
@@ -151,7 +157,7 @@ struct CacheHintKernelConfig {
   int64_t evict_last_rows{0};
   uint32_t evict_last_bytes{0};
   uint32_t table_bytes{0};
-  L2SecondaryHint secondary_hint{L2SecondaryHint::kNormal};
+  L2SecondaryHint secondary_hint{L2SecondaryHint::kUnchanged};
   bool use_range_policy{false};
 };
 
@@ -172,7 +178,7 @@ struct CacheHintKernelContext {
               "r"(config.table_bytes));
       } else {
         asm volatile(
-            "createpolicy.range.L2::evict_last.L2::evict_normal.b64 %0, [%1], %2, %3;"
+            "createpolicy.range.L2::evict_last.b64 %0, [%1], %2, %3;"
             : "=l"(range_policy)
             : "l"(table_base), "r"(config.evict_last_bytes),
               "r"(config.table_bytes));
@@ -188,38 +194,64 @@ template <typename VecT, bool EvictLast>
 __device__ __forceinline__ VecT LoadWithDirectL2Hint(const VecT* input,
                                                      L2SecondaryHint secondary) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  if constexpr (sizeof(VecT) == 4) {
+  if constexpr (sizeof(VecT) == 2) {
+    union { VecT value; uint16_t bits; } out;
+    if constexpr (EvictLast) {
+      asm volatile("ld.global.nc.L2::evict_last.b16 %0, [%1];" : "=h"(out.bits) : "l"(input));
+    } else if (secondary == L2SecondaryHint::kFirst) {
+      asm volatile("ld.global.nc.L2::evict_first.b16 %0, [%1];" : "=h"(out.bits) : "l"(input));
+    } else {
+      return *input;
+    }
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 4) {
     union { VecT value; uint32_t bits; } out;
     if constexpr (EvictLast) {
-      asm volatile("ld.global.L2::evict_last.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_last.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
     } else if (secondary == L2SecondaryHint::kFirst) {
-      asm volatile("ld.global.L2::evict_first.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_first.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
     } else {
-      asm volatile("ld.global.L2::evict_normal.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+      return *input;
     }
     return out.value;
   } else if constexpr (sizeof(VecT) == 8) {
     union { VecT value; uint64_t bits; } out;
     if constexpr (EvictLast) {
-      asm volatile("ld.global.L2::evict_last.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_last.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
     } else if (secondary == L2SecondaryHint::kFirst) {
-      asm volatile("ld.global.L2::evict_first.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_first.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
     } else {
-      asm volatile("ld.global.L2::evict_normal.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+      return *input;
+    }
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 16) {
+    union { VecT value; uint32_t bits[4]; } out;
+    if constexpr (EvictLast) {
+      asm volatile("ld.global.nc.L2::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+    } else if (secondary == L2SecondaryHint::kFirst) {
+      asm volatile("ld.global.nc.L2::evict_first.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+    } else {
+      return *input;
     }
     return out.value;
   } else {
-    static_assert(sizeof(VecT) == 16, "cuEmbed cache hints support 4/8/16-byte vectors");
-    union { VecT value; uint32_t bits[4]; } out;
+    static_assert(sizeof(VecT) == 32, "unsupported cuEmbed vector width");
+    union { VecT value; uint32_t bits[8]; } out;
+    const auto* second = reinterpret_cast<const char*>(input) + 16;
     if constexpr (EvictLast) {
-      asm volatile("ld.global.L2::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];"
+      asm volatile("ld.global.nc.L2::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];"
                    : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[4]), "=r"(out.bits[5]), "=r"(out.bits[6]), "=r"(out.bits[7]) : "l"(second));
     } else if (secondary == L2SecondaryHint::kFirst) {
-      asm volatile("ld.global.L2::evict_first.v4.b32 {%0,%1,%2,%3}, [%4];"
+      asm volatile("ld.global.nc.L2::evict_first.v4.b32 {%0,%1,%2,%3}, [%4];"
                    : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+      asm volatile("ld.global.nc.L2::evict_first.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[4]), "=r"(out.bits[5]), "=r"(out.bits[6]), "=r"(out.bits[7]) : "l"(second));
     } else {
-      asm volatile("ld.global.L2::evict_normal.v4.b32 {%0,%1,%2,%3}, [%4];"
-                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+      return *input;
     }
     return out.value;
   }
@@ -233,19 +265,31 @@ template <typename VecT>
 __device__ __forceinline__ VecT LoadWithRangeL2Hint(const VecT* input,
                                                     const uint64_t policy) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  if constexpr (sizeof(VecT) == 4) {
+  if constexpr (sizeof(VecT) == 2) {
+    union { VecT value; uint16_t bits; } out;
+    asm volatile("ld.global.nc.L2::cache_hint.b16 %0, [%1], %2;" : "=h"(out.bits) : "l"(input), "l"(policy));
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 4) {
     union { VecT value; uint32_t bits; } out;
-    asm volatile("ld.global.L2::cache_hint.b32 %0, [%1], %2;" : "=r"(out.bits) : "l"(input), "l"(policy));
+    asm volatile("ld.global.nc.L2::cache_hint.b32 %0, [%1], %2;" : "=r"(out.bits) : "l"(input), "l"(policy));
     return out.value;
   } else if constexpr (sizeof(VecT) == 8) {
     union { VecT value; uint64_t bits; } out;
-    asm volatile("ld.global.L2::cache_hint.b64 %0, [%1], %2;" : "=l"(out.bits) : "l"(input), "l"(policy));
+    asm volatile("ld.global.nc.L2::cache_hint.b64 %0, [%1], %2;" : "=l"(out.bits) : "l"(input), "l"(policy));
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 16) {
+    union { VecT value; uint32_t bits[4]; } out;
+    asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input), "l"(policy));
     return out.value;
   } else {
-    static_assert(sizeof(VecT) == 16, "cuEmbed cache hints support 4/8/16-byte vectors");
-    union { VecT value; uint32_t bits[4]; } out;
-    asm volatile("ld.global.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+    static_assert(sizeof(VecT) == 32, "unsupported cuEmbed vector width");
+    union { VecT value; uint32_t bits[8]; } out;
+    const auto* second = reinterpret_cast<const char*>(input) + 16;
+    asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
                  : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input), "l"(policy));
+    asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(out.bits[4]), "=r"(out.bits[5]), "=r"(out.bits[6]), "=r"(out.bits[7]) : "l"(second), "l"(policy));
     return out.value;
   }
 #else
@@ -263,10 +307,15 @@ __device__ __forceinline__ VecT LoadWithCacheHint(
   if (context.config.use_range_policy) {
     return LoadWithRangeL2Hint(input, context.range_policy);
   }
+#if CUEMBED_ENABLE_EXPERIMENTAL_DIRECT_HINTS
   if (row < context.config.evict_last_rows) {
     return LoadWithDirectL2Hint<VecT, true>(input, context.config.secondary_hint);
   }
   return LoadWithDirectL2Hint<VecT, false>(input, context.config.secondary_hint);
+#else
+  (void)row;
+  return *input;
+#endif
 }
 
 /*!

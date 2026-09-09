@@ -104,8 +104,8 @@ ABSL_FLAG(int64_t, l2_evict_last_rows, 0,
 ABSL_FLAG(int64_t, l2_evict_last_region_bytes, 0,
           "Size in bytes of the physical prefix to load with L2::evict_last. "
           "Must be a whole number of embedding rows.");
-ABSL_FLAG(std::string, l2_secondary_hint, "evict_normal",
-          "Secondary L2 hint: evict_normal or evict_first.");
+ABSL_FLAG(std::string, l2_secondary_hint, "evict_unchanged",
+          "Secondary L2 hint: evict_unchanged or evict_first.");
 ABSL_FLAG(bool, l2_use_range_policy, false,
           "Use createpolicy.range instead of row-cutoff load selection.");
 #endif
@@ -164,8 +164,8 @@ CacheHintBenchmarkConfig ConfigureCacheHints(const int num_categories,
   }
   if (secondary_hint == "evict_first") {
     config.forward_config.secondary_hint = cuembed::L2SecondaryHint::kFirst;
-  } else if (secondary_hint != "evict_normal") {
-    LOG(FATAL) << "--l2_secondary_hint must be evict_normal or evict_first.";
+  } else if (secondary_hint != "evict_unchanged") {
+    LOG(FATAL) << "--l2_secondary_hint must be evict_unchanged or evict_first.";
   }
   config.forward_config.evict_last_rows = rows;
   config.forward_config.table_bytes =
@@ -391,7 +391,7 @@ void dump_csv_line(std::ofstream& outfile,
           << "," << (cache_hint.effective_rows > 0) << ","
           << cache_hint.forward_config.use_range_policy << ","
           << (cache_hint.forward_config.secondary_hint == cuembed::L2SecondaryHint::kFirst
-                  ? "evict_first" : "evict_normal") << ","
+                  ? "evict_first" : "evict_unchanged") << ","
           << cache_hint.requested_rows << "," << cache_hint.requested_bytes
           << "," << cache_hint.effective_rows << ","
           << cache_hint.effective_bytes
