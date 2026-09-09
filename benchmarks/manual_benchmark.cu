@@ -28,6 +28,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <type_traits>
 
 #include "absl/flags/flag.h"
@@ -97,6 +98,17 @@ ABSL_FLAG(int64_t, l2_persist_region_bytes, 0,
           "Size in bytes of the optional L2 persistence region. Must be a "
           "whole number of embedding rows. Zero disables byte-size "
           "configuration.");
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+ABSL_FLAG(int64_t, l2_evict_last_rows, 0,
+          "Number of physical prefix rows to load with L2::evict_last.");
+ABSL_FLAG(int64_t, l2_evict_last_region_bytes, 0,
+          "Size in bytes of the physical prefix to load with L2::evict_last. "
+          "Must be a whole number of embedding rows.");
+ABSL_FLAG(std::string, l2_secondary_hint, "evict_normal",
+          "Secondary L2 hint: evict_normal or evict_first.");
+ABSL_FLAG(bool, l2_use_range_policy, false,
+          "Use createpolicy.range instead of row-cutoff load selection.");
+#endif
 // clang-format on
 
 struct L2PersistenceConfig {
@@ -111,6 +123,61 @@ struct L2PersistenceConfig {
   float hit_ratio{0.0F};
   size_t previous_set_aside_bytes{0};
 };
+
+struct CacheHintBenchmarkConfig {
+  cuembed::CacheEvictionHintConfig forward_config{};
+  int64_t requested_rows{0};
+  int64_t requested_bytes{0};
+  int64_t effective_rows{0};
+  int64_t effective_bytes{0};
+};
+
+template <typename ElemT>
+CacheHintBenchmarkConfig ConfigureCacheHints(const int num_categories,
+                                             const int embed_width,
+                                             const int64_t requested_rows,
+                                             const int64_t requested_bytes,
+                                             const std::string& secondary_hint,
+                                             const bool use_range_policy) {
+  CacheHintBenchmarkConfig config;
+  config.requested_rows = requested_rows;
+  config.requested_bytes = requested_bytes;
+  if (requested_rows == 0 && requested_bytes == 0) return config;
+  if (requested_rows < 0 || requested_bytes < 0 ||
+      (requested_rows > 0 && requested_bytes > 0)) {
+    LOG(FATAL) << "Specify exactly one non-negative cache-priority row or byte value.";
+  }
+  const int64_t row_bytes = static_cast<int64_t>(embed_width) * sizeof(ElemT);
+  int64_t rows = requested_rows;
+  if (requested_bytes > 0) {
+    if (requested_bytes % row_bytes != 0) {
+      LOG(FATAL) << "--l2_evict_last_region_bytes must be a whole number of embedding rows.";
+    }
+    rows = requested_bytes / row_bytes;
+  }
+  if (rows <= 0 || rows > num_categories) {
+    LOG(FATAL) << "Cache-priority prefix must be within the embedding table.";
+  }
+  const int64_t bytes = rows * row_bytes;
+  if (bytes > UINT32_MAX) {
+    LOG(FATAL) << "Cache-priority prefix exceeds PTX's 32-bit range-policy size limit.";
+  }
+  if (secondary_hint == "evict_first") {
+    config.forward_config.secondary_hint = cuembed::L2SecondaryHint::kFirst;
+  } else if (secondary_hint != "evict_normal") {
+    LOG(FATAL) << "--l2_secondary_hint must be evict_normal or evict_first.";
+  }
+  config.forward_config.evict_last_rows = rows;
+  config.forward_config.table_bytes =
+      static_cast<size_t>(num_categories) * static_cast<size_t>(row_bytes);
+  config.forward_config.use_range_policy = use_range_policy;
+  if (use_range_policy && config.forward_config.table_bytes > UINT32_MAX) {
+    LOG(FATAL) << "Range policy requires an embedding table no larger than 4 GB.";
+  }
+  config.effective_rows = rows;
+  config.effective_bytes = bytes;
+  return config;
+}
 
 template <typename ElemT>
 L2PersistenceConfig ConfigureL2Persistence(
@@ -278,6 +345,12 @@ void dump_csv_header(std::ofstream& outfile) {
              "l2_persist_requested_bytes,l2_persist_effective_start_row,"
              "l2_persist_effective_rows,l2_persist_effective_bytes,"
              "l2_persist_reserved_bytes,l2_persist_hit_ratio"
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+             ",l2_cache_hint_enabled,l2_cache_hint_range_policy,"
+             "l2_cache_hint_secondary,l2_cache_hint_requested_rows,"
+             "l2_cache_hint_requested_bytes,l2_cache_hint_effective_rows,"
+             "l2_cache_hint_effective_bytes"
+#endif
           << std::endl;
 }
 
@@ -288,7 +361,11 @@ void dump_csv_line(std::ofstream& outfile,
                    double elapsed_time_ms,
                    double algo_bw_l2,
                    double algo_bw_dram,
-                   const L2PersistenceConfig& l2_persistence) {
+                   const L2PersistenceConfig& l2_persistence
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+                   , const CacheHintBenchmarkConfig& cache_hint
+#endif
+                   ) {
   outfile << options.num_categories() << "," << options.batch_size() << ","
           << options.hotness() << "," << options.alpha() << ","
           << options.embed_width() << ","
@@ -309,7 +386,17 @@ void dump_csv_line(std::ofstream& outfile,
           << l2_persistence.effective_rows << ","
           << l2_persistence.effective_bytes << ","
           << l2_persistence.reserved_bytes << ","
-          << l2_persistence.hit_ratio << std::endl;
+          << l2_persistence.hit_ratio
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+          << "," << (cache_hint.effective_rows > 0) << ","
+          << cache_hint.forward_config.use_range_policy << ","
+          << (cache_hint.forward_config.secondary_hint == cuembed::L2SecondaryHint::kFirst
+                  ? "evict_first" : "evict_normal") << ","
+          << cache_hint.requested_rows << "," << cache_hint.requested_bytes
+          << "," << cache_hint.effective_rows << ","
+          << cache_hint.effective_bytes
+#endif
+          << std::endl;
 }
 
 bool file_exists(const std::string& fname) {
@@ -364,7 +451,12 @@ void EmbeddingLookupBenchmark(const int num_categories,
 
   std::ofstream outfile;
   if (enable_csv) {
-    std::string fname = "manual_benchmark_out.csv";
+    std::string fname =
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+        "cache_hint_benchmark_out.csv";
+#else
+        "manual_benchmark_out.csv";
+#endif
     bool existed_before = file_exists(fname);
     outfile.open(fname, std::ios::out | std::ios::app);
 
@@ -393,6 +485,16 @@ void EmbeddingLookupBenchmark(const int num_categories,
       l2_persist_start_row,
       l2_persist_rows,
       l2_persist_region_bytes);
+  CacheHintBenchmarkConfig cache_hint;
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+  cache_hint = ConfigureCacheHints<ElemT>(
+      num_categories,
+      embed_width,
+      absl::GetFlag(FLAGS_l2_evict_last_rows),
+      absl::GetFlag(FLAGS_l2_evict_last_region_bytes),
+      absl::GetFlag(FLAGS_l2_secondary_hint),
+      absl::GetFlag(FLAGS_l2_use_range_policy));
+#endif
 
   // Used for clearing caches
   thrust::device_vector<int> clear_cache_buffer;
@@ -401,13 +503,27 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
   ElemT clear_cache_max = static_cast<ElemT>(0);
 
+  auto run_forward = [&]() {
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
+                                                         d_a.embedding,
+                                                         d_a.indices,
+                                                         d_a.offsets,
+                                                         d_a.weights,
+                                                         &d_a.result,
+                                                         cache_hint.forward_config);
+#else
+    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
+                                                         d_a.embedding,
+                                                         d_a.indices,
+                                                         d_a.offsets,
+                                                         d_a.weights,
+                                                         &d_a.result);
+#endif
+  };
+
   // Warm up
-  utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
-                                                       d_a.embedding,
-                                                       d_a.indices,
-                                                       d_a.offsets,
-                                                       d_a.weights,
-                                                       &d_a.result);
+  run_forward();
 
   if (clear_caches) {
     clear_cache(&clear_cache_max, clear_cache_buffer);
@@ -424,12 +540,7 @@ void EmbeddingLookupBenchmark(const int num_categories,
       cudaEventRecord(start);
     }
 
-    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
-                                                         d_a.embedding,
-                                                         d_a.indices,
-                                                         d_a.offsets,
-                                                         d_a.weights,
-                                                         &d_a.result);
+    run_forward();
 
     if (clear_caches || (iter == iterations - 1)) {
       cudaEventRecord(stop);
@@ -466,7 +577,11 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms,
                   algo_bw,
                   0.0 /*algo_bw_dram*/,
-                  l2_persistence);
+                  l2_persistence
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+                  , cache_hint
+#endif
+                  );
   }
   LOG(INFO) << "Embedding forward. Iterations: "
             << absl::StrFormat("%d ", iterations) << ", Total time [ms]: "
@@ -560,7 +675,11 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms_transpose,
                   0.0,
                   algo_bw_transpose,
-                  l2_persistence);
+                  l2_persistence
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+                  , cache_hint
+#endif
+                  );
   }
 
   LOG(INFO) << "Transpose. Iterations: " << absl::StrFormat("%d ", iterations)
@@ -681,7 +800,11 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms_backward,
                   algo_bw_backward_l2,
                   algo_bw_backward_dram,
-                  l2_persistence);
+                  l2_persistence
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+                  , cache_hint
+#endif
+                  );
   }
 
   LOG(INFO) << "Backward. Iterations: " << absl::StrFormat("%d ", iterations)

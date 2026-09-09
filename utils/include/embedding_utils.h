@@ -91,7 +91,8 @@ void RunForward(const utils::AllocationOptions& options,
                 const thrust::device_vector<IndexT>& indices,
                 const thrust::device_vector<OffsetT>& offsets,
                 const thrust::device_vector<ElemT>& weights,
-                thrust::device_vector<ElemT>* result);
+                thrust::device_vector<ElemT>* result,
+                const CacheEvictionHintConfig& cache_hint_config = {});
 
 template <typename ElemT, typename IndexT, typename OffsetT, bool fp16_math>
 void RunForwardReference(const utils::AllocationOptions& options,

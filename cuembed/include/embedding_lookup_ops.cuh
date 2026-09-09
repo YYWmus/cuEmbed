@@ -145,6 +145,130 @@ class Addresser {
   int embed_width_;
 };
 
+// Keep the normalized device values separate from the public configuration:
+// range mode needs both the prefix and complete table span.
+struct CacheHintKernelConfig {
+  int64_t evict_last_rows{0};
+  uint32_t evict_last_bytes{0};
+  uint32_t table_bytes{0};
+  L2SecondaryHint secondary_hint{L2SecondaryHint::kNormal};
+  bool use_range_policy{false};
+};
+
+struct CacheHintKernelContext {
+  CacheHintKernelConfig config;
+  uint64_t range_policy{0};
+
+  __device__ __forceinline__ CacheHintKernelContext(
+      const void* table_base, const CacheHintKernelConfig& hint_config)
+      : config(hint_config) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (config.evict_last_rows > 0 && config.use_range_policy) {
+      if (config.secondary_hint == L2SecondaryHint::kFirst) {
+        asm volatile(
+            "createpolicy.range.L2::evict_last.L2::evict_first.b64 %0, [%1], %2, %3;"
+            : "=l"(range_policy)
+            : "l"(table_base), "r"(config.evict_last_bytes),
+              "r"(config.table_bytes));
+      } else {
+        asm volatile(
+            "createpolicy.range.L2::evict_last.L2::evict_normal.b64 %0, [%1], %2, %3;"
+            : "=l"(range_policy)
+            : "l"(table_base), "r"(config.evict_last_bytes),
+              "r"(config.table_bytes));
+      }
+    }
+#else
+    (void)table_base;
+#endif
+  }
+};
+
+template <typename VecT, bool EvictLast>
+__device__ __forceinline__ VecT LoadWithDirectL2Hint(const VecT* input,
+                                                     L2SecondaryHint secondary) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  if constexpr (sizeof(VecT) == 4) {
+    union { VecT value; uint32_t bits; } out;
+    if constexpr (EvictLast) {
+      asm volatile("ld.global.L2::evict_last.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+    } else if (secondary == L2SecondaryHint::kFirst) {
+      asm volatile("ld.global.L2::evict_first.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+    } else {
+      asm volatile("ld.global.L2::evict_normal.b32 %0, [%1];" : "=r"(out.bits) : "l"(input));
+    }
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 8) {
+    union { VecT value; uint64_t bits; } out;
+    if constexpr (EvictLast) {
+      asm volatile("ld.global.L2::evict_last.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+    } else if (secondary == L2SecondaryHint::kFirst) {
+      asm volatile("ld.global.L2::evict_first.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+    } else {
+      asm volatile("ld.global.L2::evict_normal.b64 %0, [%1];" : "=l"(out.bits) : "l"(input));
+    }
+    return out.value;
+  } else {
+    static_assert(sizeof(VecT) == 16, "cuEmbed cache hints support 4/8/16-byte vectors");
+    union { VecT value; uint32_t bits[4]; } out;
+    if constexpr (EvictLast) {
+      asm volatile("ld.global.L2::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+    } else if (secondary == L2SecondaryHint::kFirst) {
+      asm volatile("ld.global.L2::evict_first.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+    } else {
+      asm volatile("ld.global.L2::evict_normal.v4.b32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input));
+    }
+    return out.value;
+  }
+#else
+  (void)secondary;
+  return *input;
+#endif
+}
+
+template <typename VecT>
+__device__ __forceinline__ VecT LoadWithRangeL2Hint(const VecT* input,
+                                                    const uint64_t policy) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  if constexpr (sizeof(VecT) == 4) {
+    union { VecT value; uint32_t bits; } out;
+    asm volatile("ld.global.L2::cache_hint.b32 %0, [%1], %2;" : "=r"(out.bits) : "l"(input), "l"(policy));
+    return out.value;
+  } else if constexpr (sizeof(VecT) == 8) {
+    union { VecT value; uint64_t bits; } out;
+    asm volatile("ld.global.L2::cache_hint.b64 %0, [%1], %2;" : "=l"(out.bits) : "l"(input), "l"(policy));
+    return out.value;
+  } else {
+    static_assert(sizeof(VecT) == 16, "cuEmbed cache hints support 4/8/16-byte vectors");
+    union { VecT value; uint32_t bits[4]; } out;
+    asm volatile("ld.global.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(out.bits[0]), "=r"(out.bits[1]), "=r"(out.bits[2]), "=r"(out.bits[3]) : "l"(input), "l"(policy));
+    return out.value;
+  }
+#else
+  (void)policy;
+  return *input;
+#endif
+}
+
+template <typename VecT>
+__device__ __forceinline__ VecT LoadWithCacheHint(
+    const VecT* input, const int64_t row, const CacheHintKernelContext& context) {
+  if (context.config.evict_last_rows <= 0) {
+    return *input;
+  }
+  if (context.config.use_range_policy) {
+    return LoadWithRangeL2Hint(input, context.range_policy);
+  }
+  if (row < context.config.evict_last_rows) {
+    return LoadWithDirectL2Hint<VecT, true>(input, context.config.secondary_hint);
+  }
+  return LoadWithDirectL2Hint<VecT, false>(input, context.config.secondary_hint);
+}
+
 /*!
  * \brief Combiner takes the addresses calculated from the addresser and
  * read/write to the provided address.
@@ -196,6 +320,10 @@ class Combiner {
   template <typename ElemT>
   __device__ __host__ __forceinline__ void Gather(const InputVecT* input,
                                                   const ElemT weight) {}
+  template <typename ElemT>
+  __device__ __host__ __forceinline__ void Gather(
+      const InputVecT* input, const ElemT weight, const int64_t row,
+      const CacheHintKernelContext& context) {}
   /*!
    * \brief Reads the LoadVecT from a specified location and
    * accumulates/overwrites the internal vector depending on the reduce
@@ -204,6 +332,9 @@ class Combiner {
    * \param input Pointer of the input location.
    */
   __device__ __host__ __forceinline__ void Gather(const InputVecT* input) {}
+  __device__ __host__ __forceinline__ void Gather(
+      const InputVecT* input, const int64_t row,
+      const CacheHintKernelContext& context) {}
 };
 
 /*!
@@ -227,10 +358,26 @@ class Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kSum> {
     sum_ += VecCast<ReduceVecT, InputVecT>(tmp_vec) * weight;
   }
 
+  template <typename ElemT>
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const ElemT weight,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    InputVecT tmp_vec = LoadWithCacheHint(input, row, context);
+    sum_ += VecCast<ReduceVecT, InputVecT>(tmp_vec) * weight;
+  }
+
   __device__ __host__ __forceinline__ void Gather(const InputVecT* input) {
     // This level of indirection is required to load the vector in one
     // instruction.
     InputVecT tmp_vec = *input;
+    sum_ += tmp_vec;
+  }
+
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    InputVecT tmp_vec = LoadWithCacheHint(input, row, context);
     sum_ += tmp_vec;
   }
 
@@ -264,9 +411,27 @@ class Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kMean>
     accumulated_weight_ += weight;
   }
 
+  template <typename ElemT>
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const ElemT weight,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kSum>::Gather(
+        input, weight, row, context);
+    accumulated_weight_ += weight;
+  }
+
   __device__ __host__ __forceinline__ void Gather(const InputVecT* input) {
     Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kSum>::Gather(
         input);
+    accumulated_weight_ += 1.0f;
+  }
+
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kSum>::Gather(
+        input, row, context);
     accumulated_weight_ += 1.0f;
   }
 
@@ -306,8 +471,20 @@ class Combiner<InputVecT, ReduceVecT, OutputVecT, CombineMode::kConcat> {
                                                   const ElemT weight) {
     tmp_ = *input;
   }
+  template <typename ElemT>
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const ElemT weight,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    tmp_ = LoadWithCacheHint(input, row, context);
+  }
   __device__ __host__ __forceinline__ void Gather(const InputVecT* input) {
     tmp_ = *input;
+  }
+  __device__ __forceinline__ void Gather(const InputVecT* input,
+                                         const int64_t row,
+                                         const CacheHintKernelContext& context) {
+    tmp_ = LoadWithCacheHint(input, row, context);
   }
 
   __device__ __host__ __forceinline__ void OutputForConcatIfNeeded(

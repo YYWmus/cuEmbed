@@ -2,6 +2,7 @@
 *.so
 *.o
 *cache*
+!benchmarks/cache_hint_benchmark.cu
 .build*
 *.npy
 bin/*

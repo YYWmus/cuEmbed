@@ -32,7 +32,8 @@ void RunForward(const utils::AllocationOptions& options,
                 const thrust::device_vector<IndexT>& indices,
                 const thrust::device_vector<OffsetT>& offsets,
                 const thrust::device_vector<ElemT>& weights,
-                thrust::device_vector<ElemT>* result) {
+                thrust::device_vector<ElemT>* result,
+                const CacheEvictionHintConfig& cache_hint_config) {
   const int* offsets_ptr = nullptr;
   int hotness = options.hotness();
   if (options.is_csr()) {
@@ -54,7 +55,9 @@ void RunForward(const utils::AllocationOptions& options,
       options.batch_size(),
       hotness,
       options.combine_mode(),
-      result->data().get());
+      result->data().get(),
+      0,
+      cache_hint_config);
 }
 
 #define RUN_FORWARD_TEMPLATE(ElemT, IndexT, OffsetT, fp16_math) \
@@ -64,7 +67,8 @@ void RunForward(const utils::AllocationOptions& options,
       const thrust::device_vector<IndexT>& indices,             \
       const thrust::device_vector<OffsetT>& offsets,            \
       const thrust::device_vector<ElemT>& weights,              \
-      thrust::device_vector<ElemT>* result);
+      thrust::device_vector<ElemT>* result,                      \
+      const CacheEvictionHintConfig& cache_hint_config);
 
 RUN_FORWARD_TEMPLATE(float, int32_t, int, false);
 RUN_FORWARD_TEMPLATE(float, int64_t, int, false);

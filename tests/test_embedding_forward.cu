@@ -18,6 +18,7 @@
 // clang-format on
 
 #include <cuda_fp16.h>
+#include <thrust/equal.h>
 #include <thrust/universal_vector.h>
 
 #include "absl/log/check.h"
@@ -238,5 +239,40 @@ INSTANTIATE_TYPED_TEST_SUITE_P(
     EmbeddingRefTest,
     EmbedTestTypes,
     utils::EmbeddingRefTestNames<ForwardRefTestNameGlobal>);
+
+TEST(CacheEvictionHints, RowCutoffAndRangePreserveResults) {
+  int device = 0;
+  cudaDeviceProp properties{};
+  ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+  ASSERT_EQ(cudaGetDeviceProperties(&properties, device), cudaSuccess);
+  if (properties.major < 8) {
+    GTEST_SKIP() << "PTX cache eviction hints require sm_80 or newer";
+  }
+
+  thrust::universal_vector<float> embedding{
+      1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f,
+      9.f, 10.f, 11.f, 12.f, 13.f, 14.f, 15.f, 16.f};
+  thrust::universal_vector<int32_t> indices{0, 3};
+  thrust::universal_vector<float> cutoff_result(8);
+  thrust::universal_vector<float> range_result(8);
+
+  CacheEvictionHintConfig cutoff{};
+  cutoff.evict_last_rows = 2;
+  cutoff.secondary_hint = L2SecondaryHint::kFirst;
+  CacheEvictionHintConfig range = cutoff;
+  range.use_range_policy = true;
+  range.table_bytes = embedding.size() * sizeof(float);
+
+  EmbeddingForward<float, float, int32_t, int>(
+      embedding.data().get(), 4, indices.data().get(), nullptr, nullptr, 2, 1,
+      CombineMode::kSum, cutoff_result.data().get(), 0, cutoff);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  EmbeddingForward<float, float, int32_t, int>(
+      embedding.data().get(), 4, indices.data().get(), nullptr, nullptr, 2, 1,
+      CombineMode::kSum, range_result.data().get(), 0, range);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  EXPECT_TRUE(thrust::equal(cutoff_result.begin(), cutoff_result.end(),
+                            range_result.begin()));
+}
 
 }  // namespace cuembed

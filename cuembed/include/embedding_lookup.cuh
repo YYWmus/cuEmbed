@@ -59,7 +59,8 @@ namespace cuembed {
                                                            nullptr,            \
                                                            num_hots,           \
                                                            weights,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets != nullptr && weights != nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 8;                                            \
@@ -71,7 +72,8 @@ namespace cuembed {
                                                            offsets,            \
                                                            num_hots,           \
                                                            weights,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets == nullptr && weights == nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 8;                                            \
@@ -83,7 +85,8 @@ namespace cuembed {
                                                            nullptr,            \
                                                            num_hots,           \
                                                            nullptr,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets != nullptr && weights == nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 8;                                            \
@@ -95,7 +98,8 @@ namespace cuembed {
                                                            offsets,            \
                                                            num_hots,           \
                                                            nullptr,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets == nullptr && weights != nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 4;                                            \
@@ -107,7 +111,8 @@ namespace cuembed {
                                                            nullptr,            \
                                                            num_hots,           \
                                                            weights,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets != nullptr && weights != nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 4;                                            \
@@ -119,7 +124,8 @@ namespace cuembed {
                                                            offsets,            \
                                                            num_hots,           \
                                                            weights,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets == nullptr && weights == nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 4;                                            \
@@ -131,7 +137,8 @@ namespace cuembed {
                                                            nullptr,            \
                                                            num_hots,           \
                                                            nullptr,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else if (offsets != nullptr && weights == nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 4;                                            \
@@ -143,7 +150,8 @@ namespace cuembed {
                                                            offsets,            \
                                                            num_hots,           \
                                                            nullptr,            \
-                                                           ret);               \
+                                                           ret,                \
+                                                           cache_hint_config);  \
   } else {                                                                     \
     CUEMBED_ASSERT(false);                                                     \
   }
@@ -256,7 +264,8 @@ void EmbeddingForward(const InputT* params,
                       const int num_hots,
                       const CombineMode mode,
                       OutputT* ret,
-                      const cudaStream_t stream = 0) {
+                      const cudaStream_t stream = 0,
+                      const CacheEvictionHintConfig& cache_hint_config = {}) {
   // Concat does not have weighed option.
   CUEMBED_ASSERT(weights == nullptr || mode != CombineMode::kConcat);
 
@@ -267,6 +276,33 @@ void EmbeddingForward(const InputT* params,
   CUEMBED_ASSERT(offsets == nullptr || mode != CombineMode::kConcat);
 
   using ElemT = GetElemT<InputT>;
+  CacheHintKernelConfig kernel_cache_hint{};
+  if (cache_hint_config.evict_last_rows > 0) {
+    CUEMBED_ASSERT(cache_hint_config.evict_last_rows > 0);
+    const uint64_t row_bytes =
+        static_cast<uint64_t>(embed_width) * sizeof(ElemT);
+    const uint64_t evict_last_bytes =
+        static_cast<uint64_t>(cache_hint_config.evict_last_rows) * row_bytes;
+    CUEMBED_ASSERT(evict_last_bytes <= UINT32_MAX);
+    kernel_cache_hint.evict_last_rows = cache_hint_config.evict_last_rows;
+    kernel_cache_hint.evict_last_bytes =
+        static_cast<uint32_t>(evict_last_bytes);
+    kernel_cache_hint.secondary_hint = cache_hint_config.secondary_hint;
+    kernel_cache_hint.use_range_policy = cache_hint_config.use_range_policy;
+    if (cache_hint_config.use_range_policy) {
+      CUEMBED_ASSERT(cache_hint_config.table_bytes > 0);
+      CUEMBED_ASSERT(cache_hint_config.table_bytes <= UINT32_MAX);
+      CUEMBED_ASSERT(evict_last_bytes <= cache_hint_config.table_bytes);
+      kernel_cache_hint.table_bytes =
+          static_cast<uint32_t>(cache_hint_config.table_bytes);
+    }
+    int device = 0;
+    cudaDeviceProp device_properties{};
+    CUEMBED_ASSERT(cudaGetDevice(&device) == cudaSuccess);
+    CUEMBED_ASSERT(cudaGetDeviceProperties(&device_properties, device) ==
+                   cudaSuccess);
+    CUEMBED_ASSERT(device_properties.major >= 8);
+  }
 
   auto [element_per_load, threads_per_sample, samples_per_cta] =
       GetKernelLaunchParams<ElemT, IndexT>(

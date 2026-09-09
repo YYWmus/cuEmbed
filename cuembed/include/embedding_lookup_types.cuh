@@ -23,10 +23,29 @@
 
 #include <cuda_fp16.h>
 
+#include <cstddef>
+#include <cstdint>
+
 namespace cuembed {
 
 // TODO(zejiaz): support more modes in the kernels
 enum class CombineMode { kSum, kMean, kConcat };
+
+// L2 eviction priorities that can be expressed both by a direct load qualifier
+// and by createpolicy.range.  PTX does not provide L2::evict_unchanged as a
+// direct-load qualifier, so it is deliberately not part of this public API.
+enum class L2SecondaryHint : uint8_t { kNormal, kFirst };
+
+// Optional cache-priority configuration for EmbeddingForward.  A zero
+// evict_last_rows value leaves the existing load path untouched.  table_bytes
+// is required by range mode because createpolicy.range needs the complete
+// primary-plus-secondary address span.
+struct CacheEvictionHintConfig {
+  int64_t evict_last_rows{0};
+  size_t table_bytes{0};
+  L2SecondaryHint secondary_hint{L2SecondaryHint::kNormal};
+  bool use_range_policy{false};
+};
 
 // Various vectorized types and support functions.
 typedef struct __align__(32) { float a, b, c, d, e, f, g, h; }
