@@ -38,6 +38,92 @@ namespace cuembed {
 // Shmem for a single CTA is at most 48KB.
 #define MAX_SHMEM_BYTES_PER_CTA (48 * 1024)
 
+template <class IndexLoaderT,
+          class AddresserT,
+          class CombinerT,
+          int UnrollFactor>
+inline void LaunchEmbeddingLookupKernel(
+    const dim3 launch_grid,
+    const dim3 launch_block,
+    const size_t smem_size,
+    const cudaStream_t stream,
+    const typename AddresserT::InputType* params,
+    const int embed_width,
+    const int batch_size,
+    const typename IndexLoaderT::IndexType* indices,
+    const typename IndexLoaderT::OffsetType* offsets,
+    const int num_hots,
+    const typename IndexLoaderT::WeightType* weights,
+    typename AddresserT::OutputType* ret,
+    const CacheHintKernelConfig cache_hint_config) {
+  if (cache_hint_config.evict_last_rows > 0) {
+    EmbeddingLookUpWithCacheHintKernel<
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>
+        <<<launch_grid, launch_block, smem_size, stream>>>(params,
+                                                           embed_width,
+                                                           batch_size,
+                                                           indices,
+                                                           offsets,
+                                                           num_hots,
+                                                           weights,
+                                                           ret,
+                                                           cache_hint_config);
+  } else {
+    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>
+        <<<launch_grid, launch_block, smem_size, stream>>>(params,
+                                                           embed_width,
+                                                           batch_size,
+                                                           indices,
+                                                           offsets,
+                                                           num_hots,
+                                                           weights,
+                                                           ret);
+  }
+}
+
+template <class IndexLoaderT,
+          class AddresserT,
+          class CombinerT,
+          int UnrollFactor>
+inline void LaunchEmbeddingLookupKernel(
+    const dim3 launch_grid,
+    const dim3 launch_block,
+    const size_t smem_size,
+    const cudaStream_t stream,
+    const typename AddresserT::InputType* params,
+    const int embed_width,
+    const int batch_size,
+    const typename IndexLoaderT::IndexType* indices,
+    const typename IndexLoaderT::OffsetType* offsets,
+    const int num_hots,
+    std::nullptr_t,
+    typename AddresserT::OutputType* ret,
+    const CacheHintKernelConfig cache_hint_config) {
+  if (cache_hint_config.evict_last_rows > 0) {
+    EmbeddingLookUpWithCacheHintKernel<
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>
+        <<<launch_grid, launch_block, smem_size, stream>>>(params,
+                                                           embed_width,
+                                                           batch_size,
+                                                           indices,
+                                                           offsets,
+                                                           num_hots,
+                                                           nullptr,
+                                                           ret,
+                                                           cache_hint_config);
+  } else {
+    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>
+        <<<launch_grid, launch_block, smem_size, stream>>>(params,
+                                                           embed_width,
+                                                           batch_size,
+                                                           indices,
+                                                           offsets,
+                                                           num_hots,
+                                                           nullptr,
+                                                           ret);
+  }
+}
+
 #define EMBEDDING_LOOKUP_DISPATCH(mode, element_per_load)                      \
   using InputVecT =                                                            \
       typename VecTypeHelper<InputT, element_per_load, fp16_math>::LoadType;   \
@@ -51,8 +137,12 @@ namespace cuembed {
   if (offsets == nullptr && weights != nullptr && num_hots >= 8) {             \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 8;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -60,12 +150,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            weights,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets != nullptr && weights != nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 8;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -73,12 +167,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            weights,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets == nullptr && weights == nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 8;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -86,12 +184,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            nullptr,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets != nullptr && weights == nullptr && num_hots >= 8) {      \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 8;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -99,12 +201,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            nullptr,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets == nullptr && weights != nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 4;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -112,12 +218,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            weights,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets != nullptr && weights != nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 4;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -125,12 +235,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            weights,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets == nullptr && weights == nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, void>;                     \
     constexpr int UnrollFactor = 4;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -138,12 +252,16 @@ namespace cuembed {
                                                            num_hots,           \
                                                            nullptr,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else if (offsets != nullptr && weights == nullptr && num_hots < 8) {       \
     using IndexLoaderT = IndexLoader<IndexT, ElemT, OffsetT>;                  \
     constexpr int UnrollFactor = 4;                                            \
-    EmbeddingLookUpKernel<IndexLoaderT, AddresserT, CombinerT, UnrollFactor>   \
-        <<<launch_grid, launch_block, smem_size, stream>>>(params,             \
+    LaunchEmbeddingLookupKernel<                                               \
+        IndexLoaderT, AddresserT, CombinerT, UnrollFactor>(launch_grid,        \
+                                                           launch_block,       \
+                                                           smem_size,          \
+                                                           stream,             \
+                                                           params,             \
                                                            embed_width,        \
                                                            batch_size,         \
                                                            indices,            \
@@ -151,7 +269,7 @@ namespace cuembed {
                                                            num_hots,           \
                                                            nullptr,            \
                                                            ret,                \
-                                                           kernel_cache_hint);  \
+                                                           kernel_cache_hint); \
   } else {                                                                     \
     CUEMBED_ASSERT(false);                                                     \
   }

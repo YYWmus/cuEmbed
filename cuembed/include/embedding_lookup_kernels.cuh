@@ -44,6 +44,54 @@ __device__ __forceinline__ void EmbeddingLookupImpl(
     const typename IndexLoaderT::OffsetType* __restrict__ offsets,
     const int num_hots,
     const typename IndexLoaderT::WeightType* __restrict__ weights,
+    typename AddresserT::OutputType* __restrict__ ret) {
+  const int sample_id = blockIdx.x * blockDim.y + threadIdx.y;
+  IndexLoaderT index_loader(
+      batch_size, sample_id, indices, weights, offsets, num_hots);
+
+  if (sample_id >= batch_size) {
+    return;
+  }
+  CombinerT combiner;
+
+  AddresserT addresser(params, ret, sample_id, num_hots, embed_width);
+
+  int64_t embed_row_offset = threadIdx.x;
+  int64_t output_row_offset = threadIdx.x;
+
+#pragma unroll UnrollFactor
+  for (int i = 0; i < index_loader.GetHotness(); ++i) {
+    auto index = index_loader.GetLookUpIndex(i);
+    if constexpr (IsWeighted) {
+      auto weight = index_loader.GetWeight(i);
+      combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
+                      weight);
+    } else {
+      combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset);
+    }
+    combiner.OutputForConcatIfNeeded(addresser.GetConcatOutputAddress(i) +
+                                     output_row_offset);
+  }
+  combiner.OutputForReductionIfNeeded(addresser.GetOutputAddress() +
+                                      output_row_offset);
+}
+
+/*!
+ * \brief Embedding lookup implementation with cache-eviction hints enabled.
+ */
+template <class IndexLoaderT,
+          class AddresserT,
+          class CombinerT,
+          bool IsWeighted,
+          int UnrollFactor>
+__device__ __forceinline__ void EmbeddingLookupWithCacheHintImpl(
+    const typename AddresserT::InputType* __restrict__ params,
+    const int embed_width,
+    const int batch_size,
+    const typename IndexLoaderT::IndexType* __restrict__ indices,
+    const typename IndexLoaderT::OffsetType* __restrict__ offsets,
+    const int num_hots,
+    const typename IndexLoaderT::WeightType* __restrict__ weights,
     typename AddresserT::OutputType* __restrict__ ret,
     const CacheHintKernelConfig cache_hint_config) {
   const int sample_id = blockIdx.x * blockDim.y + threadIdx.y;
@@ -61,37 +109,19 @@ __device__ __forceinline__ void EmbeddingLookupImpl(
   int64_t embed_row_offset = threadIdx.x;
   int64_t output_row_offset = threadIdx.x;
 
-  // Keep the disabled path's ordinary vector dereference in a separate loop.
-  // This avoids placing cache-hint selection on the legacy lookup hot path.
-  if (cache_hint_config.evict_last_rows <= 0) {
 #pragma unroll UnrollFactor
-    for (int i = 0; i < index_loader.GetHotness(); ++i) {
-      auto index = index_loader.GetLookUpIndex(i);
-      if constexpr (IsWeighted) {
-        auto weight = index_loader.GetWeight(i);
-        combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
-                        weight);
-      } else {
-        combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset);
-      }
-      combiner.OutputForConcatIfNeeded(addresser.GetConcatOutputAddress(i) +
-                                       output_row_offset);
+  for (int i = 0; i < index_loader.GetHotness(); ++i) {
+    auto index = index_loader.GetLookUpIndex(i);
+    if constexpr (IsWeighted) {
+      auto weight = index_loader.GetWeight(i);
+      combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
+                      weight, index, cache_hint_context);
+    } else {
+      combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
+                      index, cache_hint_context);
     }
-  } else {
-#pragma unroll UnrollFactor
-    for (int i = 0; i < index_loader.GetHotness(); ++i) {
-      auto index = index_loader.GetLookUpIndex(i);
-      if constexpr (IsWeighted) {
-        auto weight = index_loader.GetWeight(i);
-        combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
-                        weight, index, cache_hint_context);
-      } else {
-        combiner.Gather(addresser.GetEmbeddingAddress(index) + embed_row_offset,
-                        index, cache_hint_context);
-      }
-      combiner.OutputForConcatIfNeeded(addresser.GetConcatOutputAddress(i) +
-                                       output_row_offset);
-    }
+    combiner.OutputForConcatIfNeeded(addresser.GetConcatOutputAddress(i) +
+                                     output_row_offset);
   }
   combiner.OutputForReductionIfNeeded(addresser.GetOutputAddress() +
                                       output_row_offset);
@@ -147,8 +177,7 @@ __global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpKernel(
     const typename IndexLoaderT::OffsetType* __restrict__ offsets,
     const int num_hots,
     const typename IndexLoaderT::WeightType* __restrict__ weights,
-    typename AddresserT::OutputType* __restrict__ ret,
-    const CacheHintKernelConfig cache_hint_config) {
+    typename AddresserT::OutputType* __restrict__ ret) {
   EmbeddingLookupImpl<IndexLoaderT, AddresserT, CombinerT, true, UnrollFactor>(
       params,
       embed_width,
@@ -157,8 +186,7 @@ __global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpKernel(
       offsets,
       num_hots,
       weights,
-      ret,
-      cache_hint_config);
+      ret);
 }
 
 /*!
@@ -180,8 +208,7 @@ __global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpKernel(
     const typename IndexLoaderT::OffsetType* __restrict__ offsets,
     const int num_hots,
     std::nullptr_t,
-    typename AddresserT::OutputType* __restrict__ ret,
-    const CacheHintKernelConfig cache_hint_config) {
+    typename AddresserT::OutputType* __restrict__ ret) {
   EmbeddingLookupImpl<IndexLoaderT, AddresserT, CombinerT, false, UnrollFactor>(
       params,
       embed_width,
@@ -190,8 +217,65 @@ __global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpKernel(
       offsets,
       num_hots,
       nullptr,
-      ret,
-      cache_hint_config);
+      ret);
+}
+
+/*!
+ * \brief Embedding lookup kernel with cache-eviction hints enabled.
+ */
+template <class IndexLoaderT,
+          class AddresserT,
+          class CombinerT,
+          int UnrollFactor>
+__global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpWithCacheHintKernel(
+    const typename AddresserT::InputType* __restrict__ params,
+    const int embed_width,
+    const int batch_size,
+    const typename IndexLoaderT::IndexType* __restrict__ indices,
+    const typename IndexLoaderT::OffsetType* __restrict__ offsets,
+    const int num_hots,
+    const typename IndexLoaderT::WeightType* __restrict__ weights,
+    typename AddresserT::OutputType* __restrict__ ret,
+    const CacheHintKernelConfig cache_hint_config) {
+  EmbeddingLookupWithCacheHintImpl<
+      IndexLoaderT, AddresserT, CombinerT, true, UnrollFactor>(params,
+                                                              embed_width,
+                                                              batch_size,
+                                                              indices,
+                                                              offsets,
+                                                              num_hots,
+                                                              weights,
+                                                              ret,
+                                                              cache_hint_config);
+}
+
+/*!
+ * \brief Unweighted embedding lookup kernel with cache-eviction hints enabled.
+ */
+template <class IndexLoaderT,
+          class AddresserT,
+          class CombinerT,
+          int UnrollFactor>
+__global__ void LAUNCH_BOUNDS_1024_1 EmbeddingLookUpWithCacheHintKernel(
+    const typename AddresserT::InputType* __restrict__ params,
+    const int embed_width,
+    const int batch_size,
+    const typename IndexLoaderT::IndexType* __restrict__ indices,
+    const typename IndexLoaderT::OffsetType* __restrict__ offsets,
+    const int num_hots,
+    std::nullptr_t,
+    typename AddresserT::OutputType* __restrict__ ret,
+    const CacheHintKernelConfig cache_hint_config) {
+  EmbeddingLookupWithCacheHintImpl<
+      IndexLoaderT, AddresserT, CombinerT, false, UnrollFactor>(params,
+                                                               embed_width,
+                                                               batch_size,
+                                                               indices,
+                                                               offsets,
+                                                               num_hots,
+                                                               nullptr,
+                                                               ret,
+                                                               cache_hint_config);
 }
 
 /*!
