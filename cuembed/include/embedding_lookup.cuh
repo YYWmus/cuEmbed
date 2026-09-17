@@ -165,6 +165,22 @@ namespace cuembed {
     }                                                                       \
   } while (0)
 
+inline void ValidateCacheHintDeviceSupportOnce() {
+  // CUDA device-property queries on every forward call serialize kernel
+  // submission and become part of CUDA-event timings. Cache the validation so
+  // repeated cache-hinted launches remain asynchronous.
+  static const bool validated = []() {
+    int device = 0;
+    cudaDeviceProp device_properties{};
+    CUEMBED_ASSERT(cudaGetDevice(&device) == cudaSuccess);
+    CUEMBED_ASSERT(cudaGetDeviceProperties(&device_properties, device) ==
+                   cudaSuccess);
+    CUEMBED_ASSERT(device_properties.major >= 8);
+    return true;
+  }();
+  (void)validated;
+}
+
 template <typename ElemT>
 std::tuple<int, int> DivideRowIntoVectors(const int embed_width) {
   const size_t bytes_per_row = embed_width * sizeof(ElemT);
@@ -299,12 +315,7 @@ void EmbeddingForward(const InputT* params,
       kernel_cache_hint.table_bytes =
           static_cast<uint32_t>(cache_hint_config.table_bytes);
     }
-    int device = 0;
-    cudaDeviceProp device_properties{};
-    CUEMBED_ASSERT(cudaGetDevice(&device) == cudaSuccess);
-    CUEMBED_ASSERT(cudaGetDeviceProperties(&device_properties, device) ==
-                   cudaSuccess);
-    CUEMBED_ASSERT(device_properties.major >= 8);
+    ValidateCacheHintDeviceSupportOnce();
   }
 
   auto [element_per_load, threads_per_sample, samples_per_cta] =
