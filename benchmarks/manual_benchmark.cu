@@ -284,7 +284,7 @@ L2PersistenceConfig ConfigureL2Persistence(
       1.0F, static_cast<float>(actual_set_aside) /
                  static_cast<float>(effective_bytes));
   stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
   CHECK_CUDA(cudaStreamSetAttribute(
       0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
 
