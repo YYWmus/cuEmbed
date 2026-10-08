@@ -16,6 +16,6 @@
 include_directories(${CUEMBED_PROJECT_SOURCE_DIR})
 
 find_package(CUDAToolkit)
-add_library(utils OBJECT src/embedding_allocation.cu src/embedding_gpu_forward.cu src/embedding_gpu_transpose.cu src/embedding_gpu_backward.cu src/embedding_cpu.cu src/datagen.cpp)
+add_library(utils OBJECT src/embedding_allocation.cu src/embedding_gpu_forward.cu src/embedding_gpu_transpose.cu src/embedding_gpu_backward.cu src/embedding_cpu.cu src/datagen.cpp src/grouped_datagen.cpp)
 target_include_directories(utils PRIVATE ${CUDAToolkit_INCLUDE_DIRS} absl::log absl::check gtest)
 target_link_libraries(utils PRIVATE CUDA::cudart absl::log absl::check gtest)

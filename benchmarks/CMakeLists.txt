@@ -31,6 +31,22 @@ set_target_properties(manual_benchmark
   PROPERTIES 
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/benchmarks")
 
+add_executable(grouped_layout_benchmark grouped_layout_benchmark.cu)
+target_include_directories(grouped_layout_benchmark PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(
+  grouped_layout_benchmark PRIVATE
+  cuembed_hdrs
+  cuda
+  utils
+  absl::log
+  absl::log_initialize
+  absl::check
+  absl::flags
+  absl::flags_parse)
+set_target_properties(grouped_layout_benchmark
+  PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/benchmarks")
+
 add_executable(criteo_benchmark criteo_benchmark.cu)
 target_include_directories(criteo_benchmark PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(
