@@ -98,6 +98,9 @@ ABSL_FLAG(int64_t, l2_persist_region_bytes, 0,
           "Size in bytes of the optional L2 persistence region. Must be a "
           "whole number of embedding rows. Zero disables byte-size "
           "configuration.");
+ABSL_FLAG(std::string, l2_persist_lifetime, "run",
+          "Persistence lifetime: run retains priority across invocations; "
+          "kernel resets priority after every forward lookup.");
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
 ABSL_FLAG(int64_t, l2_evict_last_rows, 0,
           "Number of physical prefix rows to load with L2::evict_last.");
@@ -122,7 +125,38 @@ struct L2PersistenceConfig {
   int64_t reserved_bytes{0};
   float hit_ratio{0.0F};
   size_t previous_set_aside_bytes{0};
+  void* base_ptr{nullptr};
 };
+
+void EnableL2Persistence(const L2PersistenceConfig& config) {
+  if (!config.enabled) return;
+  cudaStreamAttrValue attribute{};
+  attribute.accessPolicyWindow.base_ptr = config.base_ptr;
+  attribute.accessPolicyWindow.num_bytes = config.effective_bytes;
+  attribute.accessPolicyWindow.hitRatio = config.hit_ratio;
+  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  CHECK_CUDA(cudaStreamSetAttribute(
+      0, cudaStreamAttributeAccessPolicyWindow, &attribute));
+}
+
+void DisableAndResetL2Persistence(const L2PersistenceConfig& config) {
+  if (!config.enabled) return;
+  cudaStreamAttrValue attribute{};
+  attribute.accessPolicyWindow.num_bytes = 0;
+  attribute.accessPolicyWindow.hitRatio = 1.0F;
+  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  CHECK_CUDA(cudaStreamSetAttribute(
+      0, cudaStreamAttributeAccessPolicyWindow, &attribute));
+  CHECK_CUDA(cudaCtxResetPersistingL2Cache());
+}
+
+void RestoreL2PersistenceLimit(const L2PersistenceConfig& config) {
+  if (!config.enabled) return;
+  CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                config.previous_set_aside_bytes));
+}
 
 struct CacheHintBenchmarkConfig {
   cuembed::CacheEvictionHintConfig forward_config{};
@@ -275,19 +309,6 @@ L2PersistenceConfig ConfigureL2Persistence(
                  << "set-aside.";
   }
 
-  cudaStreamAttrValue stream_attribute{};
-  stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(
-      embedding + static_cast<size_t>(start_row) * embed_width);
-  stream_attribute.accessPolicyWindow.num_bytes =
-      static_cast<size_t>(effective_bytes);
-  stream_attribute.accessPolicyWindow.hitRatio = std::min(
-      1.0F, static_cast<float>(actual_set_aside) /
-                 static_cast<float>(effective_bytes));
-  stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-  CHECK_CUDA(cudaStreamSetAttribute(
-      0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
-
   config.enabled = true;
   config.requested_start_row = start_row;
   config.requested_rows = requested_rows;
@@ -296,7 +317,12 @@ L2PersistenceConfig ConfigureL2Persistence(
   config.effective_rows = effective_rows;
   config.effective_bytes = effective_bytes;
   config.reserved_bytes = static_cast<int64_t>(actual_set_aside);
-  config.hit_ratio = stream_attribute.accessPolicyWindow.hitRatio;
+  config.hit_ratio = std::min(
+      1.0F, static_cast<float>(actual_set_aside) /
+                 static_cast<float>(effective_bytes));
+  config.base_ptr = reinterpret_cast<void*>(
+      embedding + static_cast<size_t>(start_row) * embed_width);
+  EnableL2Persistence(config);
   return config;
 }
 
@@ -304,17 +330,8 @@ void ResetL2Persistence(const L2PersistenceConfig& config) {
   if (!config.enabled) {
     return;
   }
-  cudaStreamAttrValue stream_attribute{};
-  stream_attribute.accessPolicyWindow.base_ptr = nullptr;
-  stream_attribute.accessPolicyWindow.num_bytes = 0;
-  stream_attribute.accessPolicyWindow.hitRatio = 1.0F;
-  stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
-  stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-  CHECK_CUDA(cudaStreamSetAttribute(
-      0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute));
-  CHECK_CUDA(cudaCtxResetPersistingL2Cache());
-  CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
-                                config.previous_set_aside_bytes));
+  DisableAndResetL2Persistence(config);
+  RestoreL2PersistenceLimit(config);
 }
 
 template <typename T>
@@ -344,7 +361,8 @@ void dump_csv_header(std::ofstream& outfile) {
              "l2_persist_requested_start_row,l2_persist_requested_rows,"
              "l2_persist_requested_bytes,l2_persist_effective_start_row,"
              "l2_persist_effective_rows,l2_persist_effective_bytes,"
-             "l2_persist_reserved_bytes,l2_persist_hit_ratio"
+             "l2_persist_reserved_bytes,l2_persist_hit_ratio,"
+             "l2_persist_lifetime,l2_persist_reset_count,cache_clear_bytes"
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
              ",l2_cache_hint_enabled,l2_cache_hint_range_policy,"
              "l2_cache_hint_secondary,l2_cache_hint_requested_rows,"
@@ -361,7 +379,10 @@ void dump_csv_line(std::ofstream& outfile,
                    double elapsed_time_ms,
                    double algo_bw_l2,
                    double algo_bw_dram,
-                   const L2PersistenceConfig& l2_persistence
+                   const L2PersistenceConfig& l2_persistence,
+                   const std::string& l2_persist_lifetime,
+                   int64_t l2_persist_reset_count,
+                   int64_t cache_clear_bytes
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
                    , const CacheHintBenchmarkConfig& cache_hint
 #endif
@@ -386,7 +407,8 @@ void dump_csv_line(std::ofstream& outfile,
           << l2_persistence.effective_rows << ","
           << l2_persistence.effective_bytes << ","
           << l2_persistence.reserved_bytes << ","
-          << l2_persistence.hit_ratio
+          << l2_persistence.hit_ratio << "," << l2_persist_lifetime << ","
+          << l2_persist_reset_count << "," << cache_clear_bytes
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
           << "," << (cache_hint.effective_rows > 0) << ","
           << cache_hint.forward_config.use_range_policy << ","
@@ -485,6 +507,13 @@ void EmbeddingLookupBenchmark(const int num_categories,
       l2_persist_start_row,
       l2_persist_rows,
       l2_persist_region_bytes);
+  const std::string l2_persist_lifetime =
+      absl::GetFlag(FLAGS_l2_persist_lifetime);
+  if (l2_persist_lifetime != "run" && l2_persist_lifetime != "kernel") {
+    LOG(FATAL) << "--l2_persist_lifetime must be run or kernel.";
+  }
+  const bool kernel_lifetime = l2_persist_lifetime == "kernel";
+  int64_t l2_persist_reset_count = 0;
   CacheHintBenchmarkConfig cache_hint;
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
   cache_hint = ConfigureCacheHints<ElemT>(
@@ -524,9 +553,18 @@ void EmbeddingLookupBenchmark(const int num_categories,
 
   // Warm up
   run_forward();
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  if (kernel_lifetime && l2_persistence.enabled) {
+    DisableAndResetL2Persistence(l2_persistence);
+    ++l2_persist_reset_count;
+  }
 
   if (clear_caches) {
     clear_cache(&clear_cache_max, clear_cache_buffer);
+  }
+  if (kernel_lifetime && l2_persistence.enabled) {
+    EnableL2Persistence(l2_persistence);
   }
 
   // Actual run and recording elapsed time.
@@ -535,14 +573,15 @@ void EmbeddingLookupBenchmark(const int num_categories,
   cudaEventCreate(&stop);
   float elapsed_time_ms = 0.0;
 
+  const bool measure_each_forward = clear_caches || kernel_lifetime;
   for (int iter = 0; iter < iterations; iter++) {
-    if (clear_caches || (iter == 0)) {
+    if (measure_each_forward || (iter == 0)) {
       cudaEventRecord(start);
     }
 
     run_forward();
 
-    if (clear_caches || (iter == iterations - 1)) {
+    if (measure_each_forward || (iter == iterations - 1)) {
       cudaEventRecord(stop);
       CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -551,8 +590,16 @@ void EmbeddingLookupBenchmark(const int num_categories,
       elapsed_time_ms += iter_elapsed_time_ms;
     }
 
-    if (clear_caches) {
+    if (kernel_lifetime && l2_persistence.enabled) {
+      DisableAndResetL2Persistence(l2_persistence);
+      ++l2_persist_reset_count;
+    }
+
+    if (clear_caches && iter + 1 < iterations) {
       clear_cache(&clear_cache_max, clear_cache_buffer);
+    }
+    if (kernel_lifetime && l2_persistence.enabled && iter + 1 < iterations) {
+      EnableL2Persistence(l2_persistence);
     }
   }
 
@@ -577,7 +624,10 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms,
                   algo_bw,
                   0.0 /*algo_bw_dram*/,
-                  l2_persistence
+                  l2_persistence,
+                  l2_persist_lifetime,
+                  l2_persist_reset_count,
+                  static_cast<int64_t>(clear_cache_buffer.size() * sizeof(int))
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
                   , cache_hint
 #endif
@@ -601,7 +651,11 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
 
   if (forward_only) {
-    ResetL2Persistence(l2_persistence);
+    if (kernel_lifetime && l2_persistence.enabled) {
+      RestoreL2PersistenceLimit(l2_persistence);
+    } else {
+      ResetL2Persistence(l2_persistence);
+    }
     return;
   }
 
@@ -675,7 +729,10 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms_transpose,
                   0.0,
                   algo_bw_transpose,
-                  l2_persistence
+                  l2_persistence,
+                  l2_persist_lifetime,
+                  l2_persist_reset_count,
+                  static_cast<int64_t>(clear_cache_buffer.size() * sizeof(int))
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
                   , cache_hint
 #endif
@@ -800,7 +857,10 @@ void EmbeddingLookupBenchmark(const int num_categories,
                   elapsed_time_ms_backward,
                   algo_bw_backward_l2,
                   algo_bw_backward_dram,
-                  l2_persistence
+                  l2_persistence,
+                  l2_persist_lifetime,
+                  l2_persist_reset_count,
+                  static_cast<int64_t>(clear_cache_buffer.size() * sizeof(int))
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
                   , cache_hint
 #endif
@@ -838,7 +898,11 @@ void EmbeddingLookupBenchmark(const int num_categories,
   if (enable_csv) {
     outfile.close();
   }
-  ResetL2Persistence(l2_persistence);
+  if (kernel_lifetime && l2_persistence.enabled) {
+    RestoreL2PersistenceLimit(l2_persistence);
+  } else {
+    ResetL2Persistence(l2_persistence);
+  }
 }
 
 }  // namespace cuembed

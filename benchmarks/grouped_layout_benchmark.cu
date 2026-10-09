@@ -63,6 +63,8 @@ ABSL_FLAG(int64_t, l2_persist_rows, 0,
           "Rows in the optional L2 persistence window.");
 ABSL_FLAG(int64_t, l2_persist_region_bytes, 0,
           "Bytes in the optional L2 persistence window; exclusive with rows.");
+ABSL_FLAG(std::string, l2_persist_lifetime, "run",
+          "Persistence lifetime: run or kernel.");
 
 namespace {
 
@@ -77,7 +79,32 @@ struct L2PersistenceConfig {
   int64_t reserved_bytes{0};
   float hit_ratio{0.0F};
   size_t previous_set_aside_bytes{0};
+  void* base_ptr{nullptr};
 };
+
+void EnableL2Persistence(const L2PersistenceConfig& config) {
+  if (!config.enabled) return;
+  cudaStreamAttrValue attribute{};
+  attribute.accessPolicyWindow.base_ptr = config.base_ptr;
+  attribute.accessPolicyWindow.num_bytes = config.effective_bytes;
+  attribute.accessPolicyWindow.hitRatio = config.hit_ratio;
+  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  CHECK_CUDA(cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow,
+                                    &attribute));
+}
+
+void DisableAndResetL2Persistence(const L2PersistenceConfig& config) {
+  if (!config.enabled) return;
+  cudaStreamAttrValue attribute{};
+  attribute.accessPolicyWindow.num_bytes = 0;
+  attribute.accessPolicyWindow.hitRatio = 1.0F;
+  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  CHECK_CUDA(cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow,
+                                    &attribute));
+  CHECK_CUDA(cudaCtxResetPersistingL2Cache());
+}
 
 cuembed::utils::FrequencyLayout ParseFrequencyLayout(
     const std::string& value) {
@@ -154,17 +181,6 @@ L2PersistenceConfig ConfigureL2Persistence(ElemT* embedding,
   CHECK_CUDA(cudaDeviceGetLimit(&actual_set_aside,
                                 cudaLimitPersistingL2CacheSize));
 
-  cudaStreamAttrValue attribute{};
-  attribute.accessPolicyWindow.base_ptr =
-      embedding + static_cast<size_t>(start_row) * embed_width;
-  attribute.accessPolicyWindow.num_bytes = effective_bytes;
-  attribute.accessPolicyWindow.hitRatio = std::min(
-      1.0F, static_cast<float>(actual_set_aside) / effective_bytes);
-  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-  CHECK_CUDA(cudaStreamSetAttribute(
-      0, cudaStreamAttributeAccessPolicyWindow, &attribute));
-
   config.enabled = true;
   config.requested_start_row = start_row;
   config.requested_rows = rows;
@@ -173,21 +189,16 @@ L2PersistenceConfig ConfigureL2Persistence(ElemT* embedding,
   config.effective_rows = effective_rows;
   config.effective_bytes = effective_bytes;
   config.reserved_bytes = actual_set_aside;
-  config.hit_ratio = attribute.accessPolicyWindow.hitRatio;
+  config.hit_ratio = std::min(
+      1.0F, static_cast<float>(actual_set_aside) / effective_bytes);
+  config.base_ptr = embedding + static_cast<size_t>(start_row) * embed_width;
+  EnableL2Persistence(config);
   return config;
 }
 
 void ResetL2Persistence(const L2PersistenceConfig& config) {
   if (!config.enabled) return;
-  cudaStreamAttrValue attribute{};
-  attribute.accessPolicyWindow.base_ptr = nullptr;
-  attribute.accessPolicyWindow.num_bytes = 0;
-  attribute.accessPolicyWindow.hitRatio = 1.0F;
-  attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
-  attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-  CHECK_CUDA(cudaStreamSetAttribute(
-      0, cudaStreamAttributeAccessPolicyWindow, &attribute));
-  CHECK_CUDA(cudaCtxResetPersistingL2Cache());
+  DisableAndResetL2Persistence(config);
   CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
                                 config.previous_set_aside_bytes));
 }
@@ -296,7 +307,8 @@ void DumpCsvHeader(std::ofstream& output) {
          "l2_persist_requested_rows,l2_persist_requested_bytes,"
          "l2_persist_effective_start_row,l2_persist_effective_rows,"
          "l2_persist_effective_bytes,l2_persist_reserved_bytes,"
-         "l2_persist_hit_ratio\n";
+         "l2_persist_hit_ratio,l2_persist_lifetime,l2_persist_reset_count,"
+         "cache_clear_bytes\n";
 }
 
 template <typename ElemT, typename IndexT, bool fp16_math>
@@ -313,6 +325,12 @@ void RunBenchmark(const cuembed::utils::GroupedWorkloadConfig& config,
   }
   const int embed_width = absl::GetFlag(FLAGS_embed_width);
   const int iterations = absl::GetFlag(FLAGS_iterations);
+  const std::string persistence_lifetime =
+      absl::GetFlag(FLAGS_l2_persist_lifetime);
+  if (persistence_lifetime != "run" && persistence_lifetime != "kernel") {
+    LOG(FATAL) << "--l2_persist_lifetime must be run or kernel.";
+  }
+  const bool kernel_lifetime = persistence_lifetime == "kernel";
   if (embed_width <= 0 || iterations <= 0) {
     LOG(FATAL) << "embed_width and iterations must be positive.";
   }
@@ -366,28 +384,41 @@ void RunBenchmark(const cuembed::utils::GroupedWorkloadConfig& config,
 
   run_forward();
   CHECK_CUDA(cudaDeviceSynchronize());
+  int64_t persistence_reset_count = 0;
+  if (kernel_lifetime && persistence.enabled) {
+    DisableAndResetL2Persistence(persistence);
+    ++persistence_reset_count;
+  }
   if (clear_caches) {
     clear_sink = thrust::reduce(clear_buffer.begin(), clear_buffer.end(), 0);
   }
+  if (kernel_lifetime && persistence.enabled) EnableL2Persistence(persistence);
 
   cudaEvent_t start_event, stop_event;
   CHECK_CUDA(cudaEventCreate(&start_event));
   CHECK_CUDA(cudaEventCreate(&stop_event));
   float elapsed_ms = 0.0F;
   for (int iteration = 0; iteration < iterations; ++iteration) {
-    if (clear_caches || iteration == 0) {
+    if (clear_caches || kernel_lifetime || iteration == 0) {
       CHECK_CUDA(cudaEventRecord(start_event));
     }
     run_forward();
-    if (clear_caches || iteration + 1 == iterations) {
+    if (clear_caches || kernel_lifetime || iteration + 1 == iterations) {
       CHECK_CUDA(cudaEventRecord(stop_event));
       CHECK_CUDA(cudaEventSynchronize(stop_event));
       float interval_ms = 0.0F;
       CHECK_CUDA(cudaEventElapsedTime(&interval_ms, start_event, stop_event));
       elapsed_ms += interval_ms;
     }
-    if (clear_caches) {
+    if (kernel_lifetime && persistence.enabled) {
+      DisableAndResetL2Persistence(persistence);
+      ++persistence_reset_count;
+    }
+    if (clear_caches && iteration + 1 < iterations) {
       clear_sink = thrust::reduce(clear_buffer.begin(), clear_buffer.end(), 0);
+    }
+    if (kernel_lifetime && persistence.enabled && iteration + 1 < iterations) {
+      EnableL2Persistence(persistence);
     }
   }
   if (clear_sink == std::numeric_limits<int>::min()) std::cerr << clear_sink;
@@ -444,7 +475,9 @@ void RunBenchmark(const cuembed::utils::GroupedWorkloadConfig& config,
            << persistence.effective_start_row << ","
            << persistence.effective_rows << ","
            << persistence.effective_bytes << ","
-           << persistence.reserved_bytes << "," << persistence.hit_ratio
+           << persistence.reserved_bytes << "," << persistence.hit_ratio << ","
+           << persistence_lifetime << "," << persistence_reset_count << ","
+           << clear_buffer.size() * sizeof(int)
            << "\n";
   }
 
@@ -459,7 +492,12 @@ void RunBenchmark(const cuembed::utils::GroupedWorkloadConfig& config,
             << " application_bw_gbps=" << algo_bw;
   CHECK_CUDA(cudaEventDestroy(start_event));
   CHECK_CUDA(cudaEventDestroy(stop_event));
-  ResetL2Persistence(persistence);
+  if (kernel_lifetime && persistence.enabled) {
+    CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                  persistence.previous_set_aside_bytes));
+  } else {
+    ResetL2Persistence(persistence);
+  }
 }
 
 }  // namespace
