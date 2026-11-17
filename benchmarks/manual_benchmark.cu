@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <sstream>
+#include <vector>
 #include <type_traits>
 
 #include "absl/flags/flag.h"
@@ -54,6 +56,12 @@ ABSL_FLAG(int, hotness, 1,
           "Number of nonzero indices per sample");
 ABSL_FLAG(int, iterations, 1,
           "Number of iterations to run benchmark");
+ABSL_FLAG(std::string, input_mode, "replay",
+          "Forward input mode: replay reuses one batch; stream consumes one "
+          "pre-generated device-resident batch per invocation (forward_only).");
+ABSL_FLAG(int, warmup_iterations, 1,
+          "Number of untimed forward invocations before measurement; zero "
+          "disables warmup. Streaming continues into new measured batches.");
 ABSL_FLAG(float, alpha, 0.,
           "alpha of power distribution. Use uniform if alpha is 0");
 ABSL_FLAG(bool, use_int64_indices, false,
@@ -81,8 +89,8 @@ ABSL_FLAG(bool, enable_csv, false,
 ABSL_FLAG(bool, enable_stderr, true,
           "If true, will set stderr log level to INFO.");
 ABSL_FLAG(bool, clear_caches, true,
-          "If true, will clear caches between invocations by summing the "
-          "full embedding table.");
+          "If true, evict caches before each forward using a reduction over "
+          "a separate 1.024 GB buffer, outside the forward timing.");
 ABSL_FLAG(bool, permute_indices, true,
           "If true, randomly permute generated category ids before lookup. "
           "This scatters power-law-hot logical ids across physical rows.");
@@ -353,7 +361,7 @@ std::string combine_mode_str(cuembed::CombineMode mode) {
   return "Unknown";
 }
 
-void dump_csv_header(std::ofstream& outfile) {
+void dump_csv_header(std::ostream& outfile) {
   outfile << "num_categories,batch_size,hotness,alpha,embed_width,combine_mode,"
              "permute_indices,shuffle_indices,is_csr,is_weighted,"
              "compressed_grad,skip_grad_init,name,iterations,elapsed_time_ms,"
@@ -362,7 +370,9 @@ void dump_csv_header(std::ofstream& outfile) {
              "l2_persist_requested_bytes,l2_persist_effective_start_row,"
              "l2_persist_effective_rows,l2_persist_effective_bytes,"
              "l2_persist_reserved_bytes,l2_persist_hit_ratio,"
-             "l2_persist_lifetime,l2_persist_reset_count,cache_clear_bytes"
+             "l2_persist_lifetime,l2_persist_reset_count,cache_clear_bytes,"
+             "input_mode,warmup_iterations,input_seed,input_batches,clear_caches,"
+             "timing_method"
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
              ",l2_cache_hint_enabled,l2_cache_hint_range_policy,"
              "l2_cache_hint_secondary,l2_cache_hint_requested_rows,"
@@ -395,7 +405,7 @@ void dump_csv_line(std::ofstream& outfile,
           << options.is_csr() << "," << options.is_weighted() << ","
           << options.compressed_grad() << "," << options.skip_grad_init() << ","
           << name << "," << absl::StrFormat("%d ", iterations) << ","
-          << absl::StrFormat("%.2f ", elapsed_time_ms) << ","
+          << absl::StrFormat("%.6f ", elapsed_time_ms) << ","
           << absl::StrFormat("%.6f ", elapsed_time_ms / iterations) << ","
           << absl::StrFormat("%.2f", algo_bw_l2) << ","
           << absl::StrFormat("%.2f", algo_bw_dram) << ","
@@ -408,7 +418,15 @@ void dump_csv_line(std::ofstream& outfile,
           << l2_persistence.effective_bytes << ","
           << l2_persistence.reserved_bytes << ","
           << l2_persistence.hit_ratio << "," << l2_persist_lifetime << ","
-          << l2_persist_reset_count << "," << cache_clear_bytes
+          << l2_persist_reset_count << "," << cache_clear_bytes << ","
+          << absl::GetFlag(FLAGS_input_mode) << ","
+          << absl::GetFlag(FLAGS_warmup_iterations) << ","
+          << std::default_random_engine::default_seed << ","
+          << (absl::GetFlag(FLAGS_input_mode) == "stream"
+                  ? int64_t(iterations) + absl::GetFlag(FLAGS_warmup_iterations)
+                  : 1) << ","
+          << absl::GetFlag(FLAGS_clear_caches) << ","
+          << (name == "forward" ? "per_forward_cuda_events" : "legacy_cuda_events")
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
           << "," << (cache_hint.effective_rows > 0) << ","
           << cache_hint.forward_config.use_range_policy << ","
@@ -480,6 +498,15 @@ void EmbeddingLookupBenchmark(const int num_categories,
         "manual_benchmark_out.csv";
 #endif
     bool existed_before = file_exists(fname);
+    if (existed_before) {
+      std::ifstream existing(fname);
+      std::string header;
+      std::getline(existing, header);
+      std::ostringstream expected;
+      dump_csv_header(expected);
+      CHECK_EQ(header + "\n", expected.str())
+          << "CSV schema mismatch; use a fresh output directory.";
+    }
     outfile.open(fname, std::ios::out | std::ios::app);
 
     if (!outfile.is_open()) {
@@ -514,9 +541,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
   const bool kernel_lifetime = l2_persist_lifetime == "kernel";
   int64_t l2_persist_reset_count = 0;
-  CacheHintBenchmarkConfig cache_hint;
 #ifdef CUEMBED_CACHE_HINT_BENCHMARK
-  cache_hint = ConfigureCacheHints<ElemT>(
+  const CacheHintBenchmarkConfig cache_hint = ConfigureCacheHints<ElemT>(
       num_categories,
       embed_width,
       absl::GetFlag(FLAGS_l2_evict_last_rows),
@@ -532,81 +558,89 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
   ElemT clear_cache_max = static_cast<ElemT>(0);
 
-  auto run_forward = [&]() {
-#ifdef CUEMBED_CACHE_HINT_BENCHMARK
-    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
-                                                         d_a.embedding,
-                                                         d_a.indices,
-                                                         d_a.offsets,
-                                                         d_a.weights,
-                                                         &d_a.result,
-                                                         cache_hint.forward_config);
-#else
-    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(options,
-                                                         d_a.embedding,
-                                                         d_a.indices,
-                                                         d_a.offsets,
-                                                         d_a.weights,
-                                                         &d_a.result);
-#endif
-  };
+  const bool streaming = absl::GetFlag(FLAGS_input_mode) == "stream";
+  const int warmup_iterations = absl::GetFlag(FLAGS_warmup_iterations);
+  const int64_t invocation_count = int64_t(warmup_iterations) + iterations;
 
-  // Warm up
-  run_forward();
+  // Prepare the entire stream before warmup. No generation, allocation, H2D
+  // transfer, or index-buffer copy occurs between forward invocations. Never
+  // wrap a finite pool: every invocation consumes the next generated batch.
+  // Offsets and weights stay fixed, including the per-sample CSR hotness.
+  std::vector<thrust::device_vector<IndexT>> input_batches;
+  if (streaming) {
+    size_t free_bytes = 0, total_bytes = 0;
+    CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t batch_bytes = d_a.indices.size() * sizeof(IndexT);
+    CHECK(batch_bytes == 0 || uint64_t(invocation_count) <= free_bytes / batch_bytes)
+        << "Full input stream does not fit in free device memory; reduce "
+        << "iterations, warmup_iterations, or batch_size. No pool is recycled.";
+    input_batches.reserve(static_cast<size_t>(invocation_count));
+    auto generator = index_generators::PowerLawFeatureGenerator<IndexT>(
+        num_categories - 1, hotness, alpha, shuffle_indices, permute_indices,
+        index_generators::PowerLawType::kPsx);
+    std::vector<IndexT> host_indices;
+    host_indices.reserve(d_a.indices.size());
+    for (int64_t batch = 0; batch < invocation_count; ++batch) {
+      host_indices.clear();
+      for (int sample = 0; sample < batch_size; ++sample) {
+        auto ids = generator.getCategoryIndices();
+        const size_t count = is_csr
+            ? u_a.offsets[sample + 1] - u_a.offsets[sample] : hotness;
+        host_indices.insert(host_indices.end(), ids.begin(), ids.begin() + count);
+      }
+      CHECK_EQ(host_indices.size(), d_a.indices.size());
+      input_batches.emplace_back(host_indices.begin(), host_indices.end());
+    }
+    // CPU reference must use the final measured batch, not the initial replay
+    // batch. This copy also happens before warmup and outside all timing.
+    u_a.indices.assign(host_indices.begin(), host_indices.end());
+  }
   CHECK_CUDA(cudaDeviceSynchronize());
 
-  if (kernel_lifetime && l2_persistence.enabled) {
-    DisableAndResetL2Persistence(l2_persistence);
-    ++l2_persist_reset_count;
-  }
+  auto run_forward = [&](const thrust::device_vector<IndexT>& indices) {
+    utils::RunForward<ElemT, IndexT, OffsetT, fp16_math>(
+        options, d_a.embedding, indices, d_a.offsets, d_a.weights, &d_a.result
+#ifdef CUEMBED_CACHE_HINT_BENCHMARK
+        , cache_hint.forward_config
+#endif
+        );
+  };
 
-  if (clear_caches) {
-    clear_cache(&clear_cache_max, clear_cache_buffer);
-  }
-  if (kernel_lifetime && l2_persistence.enabled) {
-    EnableL2Persistence(l2_persistence);
-  }
-
-  // Actual run and recording elapsed time.
+  // Use the same timing boundaries and synchronization in replay/stream,
+  // with/without eviction, and for either persistence lifetime. Only the
+  // forward is bracketed; all cache-policy operations are outside the events.
   cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-  float elapsed_time_ms = 0.0;
-
-  const bool measure_each_forward = clear_caches || kernel_lifetime;
-  for (int iter = 0; iter < iterations; iter++) {
-    if (measure_each_forward || (iter == 0)) {
-      cudaEventRecord(start);
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+  double elapsed_time_ms = 0.0;
+  for (int64_t invocation = 0; invocation < invocation_count; ++invocation) {
+    if (clear_caches) {
+      clear_cache(&clear_cache_max, clear_cache_buffer);
     }
-
-    run_forward();
-
-    if (measure_each_forward || (iter == iterations - 1)) {
-      cudaEventRecord(stop);
+    const auto& indices = streaming ? input_batches[invocation] : d_a.indices;
+    const bool measured = invocation >= warmup_iterations;
+    if (measured) CHECK_CUDA(cudaEventRecord(start));
+    run_forward(indices);
+    if (measured) {
+      CHECK_CUDA(cudaEventRecord(stop));
       CHECK_CUDA(cudaEventSynchronize(stop));
-
-      float iter_elapsed_time_ms = 0.0;
-      cudaEventElapsedTime(&iter_elapsed_time_ms, start, stop);
+      float iter_elapsed_time_ms = 0.0F;
+      CHECK_CUDA(cudaEventElapsedTime(&iter_elapsed_time_ms, start, stop));
       elapsed_time_ms += iter_elapsed_time_ms;
+    } else {
+      CHECK_CUDA(cudaDeviceSynchronize());
     }
-
     if (kernel_lifetime && l2_persistence.enabled) {
       DisableAndResetL2Persistence(l2_persistence);
       ++l2_persist_reset_count;
-    }
-
-    if (clear_caches && iter + 1 < iterations) {
-      clear_cache(&clear_cache_max, clear_cache_buffer);
-    }
-    if (kernel_lifetime && l2_persistence.enabled && iter + 1 < iterations) {
-      EnableL2Persistence(l2_persistence);
+      if (invocation + 1 < invocation_count) EnableL2Persistence(l2_persistence);
     }
   }
 
   double algo_bw = 0.0;
   if (options.is_csr()) {
     algo_bw = sizeof(ElemT) * iterations *
-              (d_a.offsets.back() - 1 + options.batch_size()) *
+              (u_a.indices.size() + options.batch_size()) *
               options.embed_width() / 1.e6 / elapsed_time_ms;
   } else {
     algo_bw = sizeof(ElemT) * iterations * options.batch_size() *
@@ -651,6 +685,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
   }
 
   if (forward_only) {
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
     if (kernel_lifetime && l2_persistence.enabled) {
       RestoreL2PersistenceLimit(l2_persistence);
     } else {
@@ -898,6 +934,8 @@ void EmbeddingLookupBenchmark(const int num_categories,
   if (enable_csv) {
     outfile.close();
   }
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
   if (kernel_lifetime && l2_persistence.enabled) {
     RestoreL2PersistenceLimit(l2_persistence);
   } else {
@@ -916,6 +954,17 @@ int main(int argc, char** argv) {
   int batch_size = absl::GetFlag(FLAGS_batch_size);
   int hotness = absl::GetFlag(FLAGS_hotness);
   int iterations = absl::GetFlag(FLAGS_iterations);
+  const std::string input_mode = absl::GetFlag(FLAGS_input_mode);
+  CHECK(input_mode == "replay" || input_mode == "stream")
+      << "--input_mode must be replay or stream.";
+  CHECK_GT(iterations, 0) << "--iterations must be positive.";
+  CHECK_GE(absl::GetFlag(FLAGS_warmup_iterations), 0);
+  CHECK(input_mode != "stream" || absl::GetFlag(FLAGS_forward_only))
+      << "--input_mode=stream requires --forward_only=true.";
+  CHECK_GT(absl::GetFlag(FLAGS_num_categories), 2);
+  CHECK_GT(absl::GetFlag(FLAGS_hotness), 0);
+  CHECK_LT(absl::GetFlag(FLAGS_hotness), absl::GetFlag(FLAGS_num_categories))
+      << "Cannot draw more unique IDs than available categories.";
   float alpha = absl::GetFlag(FLAGS_alpha);
   bool check_result = absl::GetFlag(FLAGS_check_result);
   bool half_embedding_type = absl::GetFlag(FLAGS_half_embedding_type);
@@ -948,6 +997,8 @@ int main(int argc, char** argv) {
             << ", forward_only: " << forward_only
             << ", enable_csv: " << enable_csv
             << ", enable_stderr: " << enable_stderr
+            << ", input_mode: " << input_mode
+            << ", warmup_iterations: " << absl::GetFlag(FLAGS_warmup_iterations)
             << ", clear_caches: " << clear_caches
             << ", permute_indices: " << permute_indices
             << ", shuffle_indices: " << shuffle_indices
