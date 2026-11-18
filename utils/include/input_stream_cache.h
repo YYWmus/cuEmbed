@@ -145,6 +145,43 @@ struct Result {
   std::string path;
 };
 
+struct Workload {
+  int warmup_iterations;
+  int iterations;
+  int64_t warmup_queries;
+  int64_t measurement_queries;
+};
+
+inline Workload ResolveWorkload(int batch, int reference_batch, int warmup,
+                                int iterations, bool profile_first_batch = false) {
+  Require(batch > 0 && reference_batch >= 0 && warmup >= 0 && iterations > 0,
+          "invalid streaming workload counts");
+  if (reference_batch == 0) reference_batch = batch;
+  Require(reference_batch >= batch, "stream reference batch must be >= batch size");
+  const int64_t warmup_queries = int64_t(reference_batch) * warmup;
+  const int64_t measurement_queries = int64_t(reference_batch) * iterations;
+  Require(warmup_queries % batch == 0 && measurement_queries % batch == 0,
+          "stream warmup and measurement query boundaries must be exactly divisible by batch size");
+  Require(warmup_queries / batch <= std::numeric_limits<int>::max() &&
+              measurement_queries / batch <= std::numeric_limits<int>::max(),
+          "scaled streaming iterations exceed int32 range");
+  return {int(warmup_queries / batch), profile_first_batch ? 1 : int(measurement_queries / batch),
+          warmup_queries, profile_first_batch ? batch : measurement_queries};
+}
+
+// Fixed storage granularity, independent of execution batches and widths.
+constexpr uint64_t kChunkQueries = 4096;
+
+template <typename IndexT>
+std::string SampleDescriptor(int rows, int hotness, float alpha,
+                             bool shuffle, bool permute) {
+  auto descriptor = Descriptor<IndexT>(rows, 0, hotness, alpha, shuffle, permute,
+                                      false, std::vector<int>{});
+  descriptor.replace(0, std::string("stream-v1").size(), "samples-v2");
+  descriptor.erase(descriptor.find(";batch=0"), std::string(";batch=0").size());
+  return descriptor + ";chunk_queries=" + std::to_string(kChunkQueries);
+}
+
 // generate and consume operate on just one host batch. A hit never constructs
 // the generator. Lock lifetime covers readers as well as atomic replacement.
 template <typename IndexT, typename Generate, typename Consume>
@@ -213,6 +250,38 @@ Result Process(const std::string& directory, const std::string& descriptor,
   Require(synced == 0, "fsync failed for " + path);
   std::filesystem::rename(temporary.path(), path);
   return {exists ? "replaced" : "created", path};
+}
+
+// Consume an exact prefix, regrouping canonical chunks into execution batches.
+// The final storage chunk can contain padding samples, never executed samples.
+template <typename IndexT, typename Generate, typename Consume>
+Result ProcessSamples(const std::string& directory, const std::string& descriptor,
+                      uint64_t queries, int batch_size, int hotness,
+                      Generate generate_chunk, Consume consume_batch) {
+  Require(batch_size > 0 && hotness > 0 && queries > 0 && queries % batch_size == 0,
+          "stream query boundary must be exactly divisible by batch size");
+  const uint64_t elements = uint64_t(batch_size) * hotness;
+  Require(elements <= std::numeric_limits<size_t>::max() / sizeof(IndexT),
+          "execution batch size overflow");
+  const uint64_t chunks = queries / kChunkQueries + (queries % kChunkQueries != 0);
+  std::vector<IndexT> batch;
+  batch.reserve(elements);
+  uint64_t remaining_queries = queries;
+  auto consume_chunk = [&](const std::vector<IndexT>& chunk) {
+    const size_t count = std::min(remaining_queries, kChunkQueries) * hotness;
+    size_t offset = 0;
+    while (offset < count) {
+      const size_t take = std::min(size_t(elements) - batch.size(), count - offset);
+      batch.insert(batch.end(), chunk.begin() + offset, chunk.begin() + offset + take);
+      offset += take;
+      if (batch.size() == elements) { consume_batch(batch); batch.clear(); }
+    }
+    remaining_queries -= count / hotness;
+  };
+  const auto result = Process<IndexT>(directory, descriptor, chunks,
+      kChunkQueries * hotness, generate_chunk, consume_chunk);
+  Require(remaining_queries == 0 && batch.empty(), "incomplete stream prefix");
+  return result;
 }
 
 }  // namespace stream_cache

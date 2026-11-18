@@ -64,6 +64,12 @@ ABSL_FLAG(std::string, input_mode, "replay",
 ABSL_FLAG(std::string, input_cache_dir, "",
           "Persistent streaming-ID cache directory; empty disables caching. "
           "Load the requested prefix before warmup, never recycle batches.");
+ABSL_FLAG(int, stream_reference_batch_size, 0,
+          "Streaming iteration counts refer to this batch size; zero uses "
+          "batch_size. Warmup and measurement boundaries must divide exactly.");
+ABSL_FLAG(bool, stream_profile_first_batch, false,
+          "Profile only the first measured streaming batch after the scaled "
+          "warmup. Throughput sweeps must leave this false.");
 ABSL_FLAG(int, warmup_iterations, 1,
           "Number of untimed forward invocations before measurement; zero "
           "disables warmup. Streaming continues into new measured batches.");
@@ -570,9 +576,15 @@ void EmbeddingLookupBenchmark(const int num_categories,
   // Prepare the entire stream before warmup. No generation, allocation, H2D
   // transfer, or index-buffer copy occurs between forward invocations. Never
   // wrap a finite pool: every invocation consumes the next generated batch.
-  // Offsets and weights stay fixed, including the per-sample CSR hotness.
+  // Fixed-hotness streams share a canonical sample sequence across batches.
   std::vector<thrust::device_vector<IndexT>> input_batches;
   if (streaming) {
+    if (is_weighted) {
+      // Match logical weights across batch sizes and widths as well as IDs.
+      for (size_t i = 0; i < u_a.weights.size(); ++i)
+        u_a.weights[i] = ((i % hotness) % 2) ? 0.25F : 0.5F;
+      thrust::copy(u_a.weights.begin(), u_a.weights.end(), d_a.weights.begin());
+    }
     size_t free_bytes = 0, total_bytes = 0;
     CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
     const size_t batch_bytes = d_a.indices.size() * sizeof(IndexT);
@@ -588,13 +600,10 @@ void EmbeddingLookupBenchmark(const int num_categories,
           num_categories - 1, hotness, alpha, shuffle_indices, permute_indices,
           index_generators::PowerLawType::kPsx);
       host_indices.clear();
-      for (int sample = 0; sample < batch_size; ++sample) {
+      for (uint64_t sample = 0; sample < utils::stream_cache::kChunkQueries; ++sample) {
         auto ids = generator->getCategoryIndices();
-        const size_t count = is_csr
-            ? u_a.offsets[sample + 1] - u_a.offsets[sample] : hotness;
-        host_indices.insert(host_indices.end(), ids.begin(), ids.begin() + count);
+        host_indices.insert(host_indices.end(), ids.begin(), ids.end());
       }
-      CHECK_EQ(host_indices.size(), d_a.indices.size());
     };
     auto consume = [&](const std::vector<IndexT>& host_indices) {
       input_batches.emplace_back(host_indices.begin(), host_indices.end());
@@ -602,20 +611,19 @@ void EmbeddingLookupBenchmark(const int num_categories,
       if (input_batches.size() == static_cast<size_t>(invocation_count))
         u_a.indices.assign(host_indices.begin(), host_indices.end());
     };
-    std::vector<OffsetT> cache_offsets;
-    if (is_csr) cache_offsets.assign(u_a.offsets.begin(), u_a.offsets.end());
-    const auto descriptor = utils::stream_cache::Descriptor<IndexT>(
-        num_categories, batch_size, hotness, alpha, shuffle_indices,
-        permute_indices, is_csr, cache_offsets);
+    const auto descriptor = utils::stream_cache::SampleDescriptor<IndexT>(
+        num_categories, hotness, alpha, shuffle_indices, permute_indices);
     try {
-      const auto cache = utils::stream_cache::Process<IndexT>(
-          absl::GetFlag(FLAGS_input_cache_dir), descriptor, invocation_count,
-          d_a.indices.size(), generate, consume);
+      const auto cache = utils::stream_cache::ProcessSamples<IndexT>(
+          absl::GetFlag(FLAGS_input_cache_dir), descriptor,
+          uint64_t(invocation_count) * batch_size, batch_size, hotness, generate, consume);
       CHECK_CUDA(cudaDeviceSynchronize());
       const double preparation_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - preparation_start).count();
       LOG(INFO) << "Input stream cache: status=" << cache.status
                 << ", path=" << cache.path << ", batches=" << invocation_count
+                << ", warmup_queries=" << int64_t(warmup_iterations) * batch_size
+                << ", measurement_queries=" << int64_t(iterations) * batch_size
                 << ", preparation_ms=" << preparation_ms;
     } catch (const std::exception& error) {
       LOG(FATAL) << error.what();
@@ -987,6 +995,26 @@ int main(int argc, char** argv) {
   CHECK_GE(absl::GetFlag(FLAGS_warmup_iterations), 0);
   CHECK(input_mode != "stream" || absl::GetFlag(FLAGS_forward_only))
       << "--input_mode=stream requires --forward_only=true.";
+  if (input_mode == "stream") {
+    CHECK(!absl::GetFlag(FLAGS_csr_input))
+        << "Streaming requires fixed hotness; batch-dependent CSR offsets "
+        << "cannot preserve a shared sample trace. Use replay for CSR.";
+    try {
+      const auto workload = cuembed::utils::stream_cache::ResolveWorkload(
+          batch_size, absl::GetFlag(FLAGS_stream_reference_batch_size),
+          absl::GetFlag(FLAGS_warmup_iterations), iterations,
+          absl::GetFlag(FLAGS_stream_profile_first_batch));
+      iterations = workload.iterations;
+      absl::SetFlag(&FLAGS_iterations, iterations);
+      absl::SetFlag(&FLAGS_warmup_iterations, workload.warmup_iterations);
+      LOG(INFO) << "Streaming workload: reference_batch_size="
+                << absl::GetFlag(FLAGS_stream_reference_batch_size)
+                << ", warmup_queries=" << workload.warmup_queries
+                << ", measurement_queries=" << workload.measurement_queries;
+    } catch (const std::exception& error) {
+      LOG(FATAL) << error.what();
+    }
+  }
   CHECK_GT(absl::GetFlag(FLAGS_num_categories), 2);
   CHECK_GT(absl::GetFlag(FLAGS_hotness), 0);
   CHECK_LT(absl::GetFlag(FLAGS_hotness), absl::GetFlag(FLAGS_num_categories))
