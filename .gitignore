@@ -2,6 +2,7 @@
 *.so
 *.o
 *cache*
+!utils/include/input_stream_cache.h
 !benchmarks/cache_hint_benchmark.cu
 .build*
 *.npy

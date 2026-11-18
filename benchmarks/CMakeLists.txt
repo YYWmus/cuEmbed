@@ -29,6 +29,8 @@ target_link_libraries(
   absl::flags_parse)
 set_target_properties(manual_benchmark
   PROPERTIES 
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/benchmarks")
 
 add_executable(grouped_layout_benchmark grouped_layout_benchmark.cu)
@@ -77,4 +79,6 @@ target_link_libraries(
   absl::flags_parse)
 set_target_properties(cache_hint_benchmark
   PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/benchmarks")

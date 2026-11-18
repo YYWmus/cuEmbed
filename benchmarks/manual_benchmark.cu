@@ -26,6 +26,7 @@
 #include <thrust/universal_vector.h>
 
 #include <fstream>
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -44,6 +45,7 @@
 #include "utils/include/datagen.h"
 #include "utils/include/embedding_allocation.h"
 #include "utils/include/embedding_utils.h"
+#include "utils/include/input_stream_cache.h"
 
 // clang-format off
 ABSL_FLAG(int, num_categories, 1048576,
@@ -59,6 +61,9 @@ ABSL_FLAG(int, iterations, 1,
 ABSL_FLAG(std::string, input_mode, "replay",
           "Forward input mode: replay reuses one batch; stream consumes one "
           "pre-generated device-resident batch per invocation (forward_only).");
+ABSL_FLAG(std::string, input_cache_dir, "",
+          "Persistent streaming-ID cache directory; empty disables caching. "
+          "Load the requested prefix before warmup, never recycle batches.");
 ABSL_FLAG(int, warmup_iterations, 1,
           "Number of untimed forward invocations before measurement; zero "
           "disables warmup. Streaming continues into new measured batches.");
@@ -575,25 +580,46 @@ void EmbeddingLookupBenchmark(const int num_categories,
         << "Full input stream does not fit in free device memory; reduce "
         << "iterations, warmup_iterations, or batch_size. No pool is recycled.";
     input_batches.reserve(static_cast<size_t>(invocation_count));
-    auto generator = index_generators::PowerLawFeatureGenerator<IndexT>(
-        num_categories - 1, hotness, alpha, shuffle_indices, permute_indices,
-        index_generators::PowerLawType::kPsx);
-    std::vector<IndexT> host_indices;
-    host_indices.reserve(d_a.indices.size());
-    for (int64_t batch = 0; batch < invocation_count; ++batch) {
+    const auto preparation_start = std::chrono::steady_clock::now();
+    using Generator = index_generators::PowerLawFeatureGenerator<IndexT>;
+    std::unique_ptr<Generator> generator;
+    auto generate = [&](std::vector<IndexT>& host_indices) {
+      if (!generator) generator = std::make_unique<Generator>(
+          num_categories - 1, hotness, alpha, shuffle_indices, permute_indices,
+          index_generators::PowerLawType::kPsx);
       host_indices.clear();
       for (int sample = 0; sample < batch_size; ++sample) {
-        auto ids = generator.getCategoryIndices();
+        auto ids = generator->getCategoryIndices();
         const size_t count = is_csr
             ? u_a.offsets[sample + 1] - u_a.offsets[sample] : hotness;
         host_indices.insert(host_indices.end(), ids.begin(), ids.begin() + count);
       }
       CHECK_EQ(host_indices.size(), d_a.indices.size());
+    };
+    auto consume = [&](const std::vector<IndexT>& host_indices) {
       input_batches.emplace_back(host_indices.begin(), host_indices.end());
+      // CPU reference uses the final measured batch, outside all timing.
+      if (input_batches.size() == static_cast<size_t>(invocation_count))
+        u_a.indices.assign(host_indices.begin(), host_indices.end());
+    };
+    std::vector<OffsetT> cache_offsets;
+    if (is_csr) cache_offsets.assign(u_a.offsets.begin(), u_a.offsets.end());
+    const auto descriptor = utils::stream_cache::Descriptor<IndexT>(
+        num_categories, batch_size, hotness, alpha, shuffle_indices,
+        permute_indices, is_csr, cache_offsets);
+    try {
+      const auto cache = utils::stream_cache::Process<IndexT>(
+          absl::GetFlag(FLAGS_input_cache_dir), descriptor, invocation_count,
+          d_a.indices.size(), generate, consume);
+      CHECK_CUDA(cudaDeviceSynchronize());
+      const double preparation_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - preparation_start).count();
+      LOG(INFO) << "Input stream cache: status=" << cache.status
+                << ", path=" << cache.path << ", batches=" << invocation_count
+                << ", preparation_ms=" << preparation_ms;
+    } catch (const std::exception& error) {
+      LOG(FATAL) << error.what();
     }
-    // CPU reference must use the final measured batch, not the initial replay
-    // batch. This copy also happens before warmup and outside all timing.
-    u_a.indices.assign(host_indices.begin(), host_indices.end());
   }
   CHECK_CUDA(cudaDeviceSynchronize());
 
