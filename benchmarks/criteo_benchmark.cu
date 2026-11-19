@@ -29,6 +29,7 @@
 #include "utils/include/embedding_allocation.h"
 #include "utils/include/embedding_utils.h"
 #include "utils/include/npy_reader.h"
+#include "utils/include/input_stream_cache.h"
 
 ABSL_FLAG(std::string, indices_npy, "", "Fused Criteo sparse IDs with shape (N, 26).");
 ABSL_FLAG(int64_t, indices_start_row, 0, "First Criteo sample row to benchmark.");
@@ -40,7 +41,11 @@ ABSL_FLAG(bool, replay, true,
 ABSL_FLAG(int, num_categories, 0, "Number of rows in the fused embedding table.");
 ABSL_FLAG(int, embed_width, 16, "Embedding vector width.");
 ABSL_FLAG(int, batch_size, 2048, "Samples per lookup invocation.");
-ABSL_FLAG(int, iterations, 100, "Number of timed lookup invocations.");
+ABSL_FLAG(int, iterations, 100, "Measured invocations at the stream reference batch size.");
+ABSL_FLAG(int, warmup_iterations, 10, "Streaming warmup invocations at the reference batch size.");
+ABSL_FLAG(int, stream_reference_batch_size, 0, "Streaming reference batch size; zero uses batch_size.");
+ABSL_FLAG(bool, stream_profile_first_batch, false,
+          "Prepare the full stream but execute only the first measured batch.");
 ABSL_FLAG(bool, use_int64_indices, true, "Use int64 rather than int32 lookup indices.");
 ABSL_FLAG(bool, half_embedding_type, false, "Use fp16 rather than fp32 embeddings.");
 ABSL_FLAG(bool, fp16_math, false, "Accumulate fp16 embeddings using fp16 arithmetic.");
@@ -336,7 +341,10 @@ void DumpCsvHeader(std::ofstream& output) {
             "l2_persist_effective_start_row,l2_persist_effective_rows,"
             "l2_persist_effective_bytes,l2_persist_reserved_bytes,"
             "l2_persist_hit_ratio,l2_persist_lifetime,l2_persist_reset_count,"
-            "cache_clear_bytes\n";
+            "cache_clear_bytes,stream_reference_batch_size,reference_warmup_iterations,"
+            "reference_iterations,warmup_iterations,warmup_rows,prepared_measurement_rows,"
+            "measurement_start_row,prepared_source_end_row,executed_source_end_row,"
+            "resident_input_bytes,preparation_ms,stream_profile_first_batch\n";
 }
 
 bool FileExists(const std::string& path) {
@@ -352,7 +360,13 @@ void RunBenchmark() {
   const int64_t num_categories = absl::GetFlag(FLAGS_num_categories);
   const int batch_size = absl::GetFlag(FLAGS_batch_size);
   const int embed_width = absl::GetFlag(FLAGS_embed_width);
-  const int iterations = absl::GetFlag(FLAGS_iterations);
+  const int reference_iterations = absl::GetFlag(FLAGS_iterations);
+  int iterations = reference_iterations;
+  int warmup_iterations = 1;
+  const int reference_batch = absl::GetFlag(FLAGS_stream_reference_batch_size) == 0
+      ? batch_size : absl::GetFlag(FLAGS_stream_reference_batch_size);
+  int64_t warmup_rows = 0, prepared_measurement_rows = 0;
+  const bool profile_first = absl::GetFlag(FLAGS_stream_profile_first_batch);
   const bool replay = absl::GetFlag(FLAGS_replay);
   const std::string persistence_lifetime =
       absl::GetFlag(FLAGS_l2_persist_lifetime);
@@ -374,6 +388,23 @@ void RunBenchmark() {
     LOG(FATAL) << "Start row and batch size must describe a valid cyclic batch.";
   }
   const int64_t start_row = requested_start;
+  if (!replay) {
+    CHECK(!kernel_lifetime) << "Streaming requires --l2_persist_lifetime=run.";
+    try {
+      const auto workload = cuembed::utils::stream_cache::ResolveWorkload(
+          batch_size, absl::GetFlag(FLAGS_stream_reference_batch_size),
+          absl::GetFlag(FLAGS_warmup_iterations), reference_iterations);
+      warmup_iterations = workload.warmup_iterations;
+      iterations = profile_first ? 1 : workload.iterations;
+      warmup_rows = workload.warmup_queries;
+      prepared_measurement_rows = workload.measurement_queries;
+    } catch (const std::exception& error) {
+      LOG(FATAL) << error.what();
+    }
+    CHECK_LE(warmup_rows + prepared_measurement_rows, num_rows - start_row)
+        << "Full streaming source range is unavailable; wrapping is disabled.";
+  }
+
 
   std::unique_ptr<cuembed::utils::NpyIntegerReader> mapping;
   if (!mapping_path.empty()) {
@@ -396,7 +427,7 @@ void RunBenchmark() {
   thrust::device_vector<ElemT> embedding(
       static_cast<size_t>(num_categories) * embed_width);
   thrust::device_vector<IndexT> device_indices(
-      static_cast<size_t>(batch_size) * kCriteoHotness);
+      replay ? static_cast<size_t>(batch_size) * kCriteoHotness : 0);
   thrust::device_vector<int> offsets;
   thrust::device_vector<ElemT> weights;
   thrust::device_vector<ElemT> result(
@@ -409,59 +440,77 @@ void RunBenchmark() {
       absl::GetFlag(FLAGS_l2_persist_rows),
       absl::GetFlag(FLAGS_l2_persist_region_bytes));
 
-  auto run_forward = [&]() {
-    cuembed::utils::RunForward<ElemT, IndexT, int, fp16_math>(
-        options, embedding, device_indices, offsets, weights, &result);
-  };
-
+  const auto preparation_start = std::chrono::steady_clock::now();
+  std::vector<thrust::device_vector<IndexT>> input_batches;
   std::vector<int64_t> last_batch;
-  if (replay) {
-    last_batch = ReadCyclicBatch(indices, start_row, batch_size);
+  size_t resident_input_bytes = device_indices.size() * sizeof(IndexT);
+  if (!replay) {
+    const int64_t prepared_rows = warmup_rows + prepared_measurement_rows;
+    size_t free_bytes = 0, total_bytes = 0;
+    CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t bytes_per_row = kCriteoHotness * sizeof(IndexT);
+    CHECK_LE(static_cast<uint64_t>(prepared_rows), free_bytes / bytes_per_row)
+        << "Full input stream does not fit in free device memory; no pool is recycled.";
+    resident_input_bytes = static_cast<size_t>(prepared_rows) * bytes_per_row;
+    input_batches.reserve(static_cast<size_t>(prepared_rows / batch_size));
+    for (int64_t row = 0; row < prepared_rows; row += batch_size) {
+      auto batch = ReadCyclicBatch(indices, start_row + row, batch_size);
+      input_batches.emplace_back(static_cast<size_t>(batch_size) * kCriteoHotness);
+      CopyIndices(batch, num_categories, &input_batches.back());
+      if (row == warmup_rows + static_cast<int64_t>(iterations - 1) * batch_size)
+        last_batch = std::move(batch);
+    }
   } else {
-    const int64_t predecessor =
-        (start_row + num_rows - (batch_size % num_rows)) % num_rows;
-    last_batch = ReadCyclicBatch(indices, predecessor, batch_size);
+    last_batch = ReadCyclicBatch(indices, start_row, batch_size);
+    CopyIndices(last_batch, num_categories, &device_indices);
   }
-  CopyIndices(last_batch, num_categories, &device_indices);
-  run_forward();
   CHECK_CUDA(cudaDeviceSynchronize());
+  const double preparation_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - preparation_start).count();
+  auto run_forward = [&](const thrust::device_vector<IndexT>& batch) {
+    cuembed::utils::RunForward<ElemT, IndexT, int, fp16_math>(
+        options, embedding, batch, offsets, weights, &result);
+  };
 
   thrust::device_vector<int> eviction_buffer;
   volatile int eviction_sink = 0;
   size_t cache_clear_bytes = 0;
   int64_t persistence_reset_count = 0;
-  if (kernel_lifetime && persistence.enabled) {
-    DisableAndResetL2Persistence(persistence);
-    ++persistence_reset_count;
-  }
+  cudaEvent_t start_event, stop_event;
+  CHECK_CUDA(cudaEventCreate(&start_event));
+  CHECK_CUDA(cudaEventCreate(&stop_event));
+  // Preserve replay's original warmup and eviction ordering.
   if (replay) {
+    run_forward(device_indices);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    if (kernel_lifetime && persistence.enabled) {
+      DisableAndResetL2Persistence(persistence);
+      ++persistence_reset_count;
+    }
     int device = 0;
     CHECK_CUDA(cudaGetDevice(&device));
     cudaDeviceProp properties{};
     CHECK_CUDA(cudaGetDeviceProperties(&properties, device));
     const size_t values = std::max<size_t>(
-        1, (static_cast<size_t>(properties.l2CacheSize) * 2 + sizeof(int) - 1) /
-               sizeof(int));
+        1, (static_cast<size_t>(properties.l2CacheSize) * 2 + sizeof(int) - 1) / sizeof(int));
     cache_clear_bytes = values * sizeof(int);
     eviction_buffer.assign(values, 1);
     eviction_sink += thrust::reduce(eviction_buffer.begin(), eviction_buffer.end(), 0);
+    if (kernel_lifetime && persistence.enabled) EnableL2Persistence(persistence);
+  } else {
+    for (int invocation = 0; invocation < warmup_iterations; ++invocation) {
+      run_forward(input_batches[invocation]);
+      CHECK_CUDA(cudaDeviceSynchronize());
+    }
   }
-  if (kernel_lifetime && persistence.enabled) EnableL2Persistence(persistence);
 
-  cudaEvent_t start_event, stop_event;
-  CHECK_CUDA(cudaEventCreate(&start_event));
-  CHECK_CUDA(cudaEventCreate(&stop_event));
-  float kernel_elapsed_ms = 0.0F;
+  double kernel_elapsed_ms = 0.0;
   const auto wall_start = std::chrono::steady_clock::now();
   for (int iteration = 0; iteration < iterations; ++iteration) {
-    if (!replay) {
-      const int64_t iteration_start =
-          (start_row + static_cast<int64_t>(iteration) * batch_size) % num_rows;
-      last_batch = ReadCyclicBatch(indices, iteration_start, batch_size);
-      CopyIndices(last_batch, num_categories, &device_indices);
-    }
+    const auto& batch = replay ? device_indices
+        : input_batches[static_cast<size_t>(warmup_iterations) + iteration];
     CHECK_CUDA(cudaEventRecord(start_event));
-    run_forward();
+    run_forward(batch);
     CHECK_CUDA(cudaEventRecord(stop_event));
     CHECK_CUDA(cudaEventSynchronize(stop_event));
     float iteration_ms = 0.0F;
@@ -482,7 +531,6 @@ void RunBenchmark() {
   const double wall_elapsed_ms =
       std::chrono::duration<double, std::milli>(wall_stop - wall_start).count();
   if (eviction_sink == std::numeric_limits<int>::min()) std::cerr << eviction_sink;
-
   if (absl::GetFlag(FLAGS_check_result)) {
     CheckResult(result, last_batch, mapping.get(), batch_size, embed_width);
   }
@@ -491,7 +539,7 @@ void RunBenchmark() {
   const int64_t rows_consumed = static_cast<int64_t>(batch_size) * iterations;
   const int64_t wrap_count = replay
       ? ((start_row + batch_size > num_rows) ? iterations : 0)
-      : (start_row + rows_consumed - 1) / num_rows;
+      : 0;
   const double bytes = static_cast<double>(sizeof(ElemT)) * rows_consumed *
                        (kCriteoHotness + 1) * embed_width;
   const double algo_bw = bytes / (kernel_elapsed_ms * 1.0e6);
@@ -514,7 +562,14 @@ void RunBenchmark() {
            << persistence.effective_rows << "," << persistence.effective_bytes << ","
            << persistence.reserved_bytes << "," << persistence.hit_ratio << ","
            << persistence_lifetime << "," << persistence_reset_count << ","
-           << cache_clear_bytes << "\n";
+           << cache_clear_bytes << "," << (replay ? 0 : reference_batch) << ","
+           << (replay ? 1 : absl::GetFlag(FLAGS_warmup_iterations)) << ","
+           << reference_iterations << "," << warmup_iterations << "," << warmup_rows << ","
+           << (replay ? batch_size : prepared_measurement_rows) << ","
+           << start_row + warmup_rows << ","
+           << start_row + warmup_rows + (replay ? batch_size : prepared_measurement_rows) << ","
+           << start_row + warmup_rows + (replay ? batch_size : rows_consumed) << ","
+           << resident_input_bytes << "," << preparation_ms << "," << (!replay && profile_first) << "\n";
   }
 
   LOG(INFO) << "Criteo forward: replay=" << replay
