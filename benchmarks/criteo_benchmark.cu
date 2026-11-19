@@ -3,6 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/reduce.h>
@@ -53,6 +54,10 @@ ABSL_FLAG(bool, check_result, false, "Check the last GPU result against a CPU re
 ABSL_FLAG(std::string, result_file, "", "Optional raw final-result output file.");
 ABSL_FLAG(bool, enable_csv, true, "Append one result row to CSV output.");
 ABSL_FLAG(std::string, csv_output, "criteo_benchmark_out.csv", "CSV output path.");
+ABSL_FLAG(std::string, iteration_timings_csv, "",
+          "Optional per-iteration timing CSV, written after measurement.");
+ABSL_FLAG(bool, diagnostic_capture, false,
+          "Bracket warmup and measurement with CUDA profiler capture calls.");
 ABSL_FLAG(int64_t, l2_persist_start_row, 0, "First physical row in the persistence window.");
 ABSL_FLAG(int64_t, l2_persist_rows, 0, "Rows in the optional L2 persistence window.");
 ABSL_FLAG(int64_t, l2_persist_region_bytes, 0,
@@ -479,6 +484,14 @@ void RunBenchmark() {
   cudaEvent_t start_event, stop_event;
   CHECK_CUDA(cudaEventCreate(&start_event));
   CHECK_CUDA(cudaEventCreate(&stop_event));
+  const auto timing_path = absl::GetFlag(FLAGS_iteration_timings_csv);
+  std::vector<float> kernel_times;
+  std::vector<double> wall_times;
+  if (!timing_path.empty()) {
+    kernel_times.reserve(iterations);
+    wall_times.reserve(iterations);
+  }
+  if (absl::GetFlag(FLAGS_diagnostic_capture)) CHECK_CUDA(cudaProfilerStart());
   // Preserve replay's original warmup and eviction ordering.
   if (replay) {
     run_forward(device_indices);
@@ -507,6 +520,8 @@ void RunBenchmark() {
   double kernel_elapsed_ms = 0.0;
   const auto wall_start = std::chrono::steady_clock::now();
   for (int iteration = 0; iteration < iterations; ++iteration) {
+    const auto iteration_start = timing_path.empty()
+        ? std::chrono::steady_clock::time_point{} : std::chrono::steady_clock::now();
     const auto& batch = replay ? device_indices
         : input_batches[static_cast<size_t>(warmup_iterations) + iteration];
     CHECK_CUDA(cudaEventRecord(start_event));
@@ -526,8 +541,26 @@ void RunBenchmark() {
     if (kernel_lifetime && persistence.enabled && iteration + 1 < iterations) {
       EnableL2Persistence(persistence);
     }
+    if (!timing_path.empty()) {
+      wall_times.push_back(std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - iteration_start).count());
+      kernel_times.push_back(iteration_ms);
+    }
   }
   const auto wall_stop = std::chrono::steady_clock::now();
+  if (absl::GetFlag(FLAGS_diagnostic_capture)) CHECK_CUDA(cudaProfilerStop());
+  if (!timing_path.empty()) {
+    std::ofstream timings(timing_path);
+    CHECK(timings.is_open()) << "Cannot write iteration timings: " << timing_path;
+    timings.precision(10);
+    timings << "iteration,source_start_row,batch_size,kernel_ms,wall_ms\n";
+    for (int i = 0; i < iterations; ++i) {
+      timings << i << "," << start_row + (replay ? 0 : warmup_rows + static_cast<int64_t>(i) * batch_size)
+              << "," << batch_size << "," << kernel_times[i] << "," << wall_times[i] << "\n";
+    }
+    timings.close();
+    CHECK(timings.good()) << "Failed writing iteration timings: " << timing_path;
+  }
   const double wall_elapsed_ms =
       std::chrono::duration<double, std::milli>(wall_stop - wall_start).count();
   if (eviction_sink == std::numeric_limits<int>::min()) std::cerr << eviction_sink;
